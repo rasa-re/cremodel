@@ -240,20 +240,6 @@ with st.sidebar.expander("🔧 Capital Expenditures"):
 # Section 3: Bridge Financing (only for value-add strategy)
 if deal_strategy == "Bridge-to-Permanent (Value-Add)":
     with st.sidebar.expander("🏦 Bridge Financing"):
-        # Checkbox to zero out all bridge financing
-        if st.button("🗑️ Clear All Bridge Financing", key="__clear_bridge__", use_container_width=True):
-            st.session_state['bridge_ltv'] = 0.0
-            st.session_state['bridge_rate'] = 0.0
-            st.session_state['bridge_term'] = 1  # Min 1 to avoid errors
-            st.session_state['bridge_io'] = True
-            st.session_state['bridge_prepay_penalty'] = 0.0
-            st.session_state['bridge_orig_points'] = 0.0
-            st.session_state['refi_year'] = 3
-            st.session_state['refi_legal_costs'] = 0
-            st.session_state['refi_cap_rate'] = 0.0
-            st.rerun()
-
-        st.markdown("---")
         bridge_ltv = st.number_input("Bridge Loan LTV (%)", value=75.0, step=1.0, max_value=100.0, key="bridge_ltv")
         bridge_rate = st.number_input("Bridge Interest Rate (%)", value=7.0, step=0.1, key="bridge_rate")
         bridge_term = st.number_input("Bridge Term (years)", value=2, step=1, min_value=1, max_value=5, key="bridge_term")
