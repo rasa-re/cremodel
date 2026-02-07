@@ -53,6 +53,8 @@ def _load_scenario(name):
         data = json.load(f)
     for k, v in data.items():
         st.session_state[k] = v
+    # Set flag to prevent auto-reset of bridge fields when loading bridge-to-perm scenario
+    st.session_state['_just_loaded_scenario'] = True
 
 # Page configuration
 st.set_page_config(
@@ -95,6 +97,8 @@ with st.sidebar.expander("💾 Scenarios", expanded=False):
                 data = json.loads(uploaded.getvalue().decode("utf-8"))
                 for k, v in data.items():
                     st.session_state[k] = v
+                # Set flag to prevent auto-reset of bridge fields when loading
+                st.session_state['_just_loaded_scenario'] = True
                 st.rerun()
             except Exception as e:
                 st.error(f"Could not load file: {e}")
@@ -104,6 +108,7 @@ with st.sidebar.expander("🎯 Deal Strategy", expanded=True):
     # Detect strategy change and reset bridge fields if switching to buy-and-hold
     prev_strategy = st.session_state.get('_prev_deal_strategy')
     current_strategy = st.session_state.get('deal_strategy', "Buy-and-Hold with Permanent Financing")
+    just_loaded_scenario = st.session_state.get('_just_loaded_scenario', False)
 
     deal_strategy = st.radio(
         "Deal Structure:",
@@ -115,8 +120,8 @@ with st.sidebar.expander("🎯 Deal Strategy", expanded=True):
         key="deal_strategy"
     )
 
-    # If user just switched from bridge-to-perm to buy-and-hold, zero out bridge fields
-    if prev_strategy == "Bridge-to-Permanent (Value-Add)" and deal_strategy == "Buy-and-Hold with Permanent Financing":
+    # Only reset bridge fields if user manually changed strategy (not from scenario load)
+    if not just_loaded_scenario and prev_strategy == "Bridge-to-Permanent (Value-Add)" and deal_strategy == "Buy-and-Hold with Permanent Financing":
         st.session_state['bridge_ltv'] = 0.0
         st.session_state['bridge_rate'] = 0.0
         st.session_state['bridge_term'] = 0
@@ -132,6 +137,9 @@ with st.sidebar.expander("🎯 Deal Strategy", expanded=True):
 
     # Track current strategy for next run
     st.session_state['_prev_deal_strategy'] = deal_strategy
+    # Clear the flag after checking it
+    if just_loaded_scenario:
+        st.session_state['_just_loaded_scenario'] = False
 
     if deal_strategy == "Buy-and-Hold with Permanent Financing":
         st.info("**Standard stabilized asset**\n• Permanent loan at acquisition\n• Hold for cash flow\n• Exit via sale or refi")
