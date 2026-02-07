@@ -1731,17 +1731,17 @@ with tab4:
 
     exit_cap_range = [5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0]
 
-    # --- Sensitivity Table 1: Exit Cap Rate vs Refi Cap Rate (Deal IRR %) ---
-    st.markdown("### Exit Cap Rate vs Refi Cap Rate (Deal IRR %)")
-    refi_cap_range = [round(refi_cap_rate + d, 1) for d in [-1.0, -0.5, 0.0, 0.5, 1.0]]
+    # --- Sensitivity Table 1: Exit Cap Rate vs Perm Interest Rate (Deal IRR %) ---
+    st.markdown("### Exit Cap Rate vs Perm Interest Rate (Deal IRR %)")
+    perm_rate_range = [round(perm_rate + d, 1) for d in [-1.0, -0.5, 0.0, 0.5, 1.0]]
 
     sens1_data = {}
-    for rc in refi_cap_range:
+    for pr in perm_rate_range:
         row_vals = []
         for ec in exit_cap_range:
-            d_irr, _ = _run(purchase_price, ec, perm_rate, rc)
+            d_irr, _ = _run(purchase_price, ec, pr, refi_cap_rate)
             row_vals.append(f"{d_irr*100:.1f}%" if d_irr is not None else "N/A")
-        sens1_data[f"Refi Cap {rc}%"] = row_vals
+        sens1_data[f"Perm Rate {pr}%"] = row_vals
 
     sens1_df = pd.DataFrame(sens1_data, index=[f"{ec}%" for ec in exit_cap_range])
     sens1_df.index.name = "Exit Cap Rate"
