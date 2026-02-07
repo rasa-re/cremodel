@@ -873,13 +873,21 @@ with tab1:
 
     with col2:
         st.markdown("**USES**")
-        uses_data = pd.DataFrame([
+        uses_rows = [
             {'Use': 'Purchase Price', 'Amount': sources_uses['uses']['purchase_price']},
             {'Use': 'Closing Costs', 'Amount': sources_uses['uses']['closing_costs']},
             {'Use': loan_orig_label, 'Amount': sources_uses['uses']['bridge_origination']},  # Reusing field name
-            {'Use': 'Acquisition Fee', 'Amount': sources_uses['uses']['acquisition_fee']},
-            {'Use': 'TOTAL USES', 'Amount': sources_uses['uses']['total_uses']}
-        ])
+            {'Use': 'Acquisition Fee', 'Amount': sources_uses['uses']['acquisition_fee']}
+        ]
+        # Add value-add capex if applicable
+        if value_add_capex > 0:
+            uses_rows.append({'Use': 'Value-Add CapEx', 'Amount': value_add_capex})
+
+        # Add total
+        total_uses_amount = sources_uses['uses']['total_uses'] + value_add_capex
+        uses_rows.append({'Use': 'TOTAL USES', 'Amount': total_uses_amount})
+
+        uses_data = pd.DataFrame(uses_rows)
         st.dataframe(
             uses_data.style.format({'Amount': '${:,.0f}'}),
             use_container_width=True,
