@@ -696,7 +696,7 @@ with tab1:
             'Year': year,
             'Lease Status': lease_status,
             'NOI': noi,
-            'Operating Expenses': total_operating_expenses,
+            'Non-Operating Expenses': total_operating_expenses,
             'Value-Add CapEx': va_capex_this_year,
             'Cash Before Debt': cash_before_debt,
             'Debt Service': debt_service,
@@ -712,7 +712,7 @@ with tab1:
     st.dataframe(
         cf_df.style.format({
             'NOI': '${:,.0f}',
-            'Operating Expenses': '${:,.0f}',
+            'Non-Operating Expenses': '${:,.0f}',
             'Value-Add CapEx': '${:,.0f}',
             'Cash Before Debt': '${:,.0f}',
             'Debt Service': '${:,.0f}',
