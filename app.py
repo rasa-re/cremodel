@@ -72,32 +72,32 @@ with st.sidebar.expander("💾 Scenarios", expanded=False):
     scenarios = _list_scenarios()
     if scenarios:
         load_pick = st.selectbox("Load scenario", options=["—"] + scenarios, key="__load_pick__")
-        col_lb, col_db = st.sidebar.columns(2)
         if load_pick != "—":
-            col_lb.button("Load", key="__load_btn__", on_click=_load_scenario, args=(load_pick,), use_container_width=True)
+            col_lb, col_db = st.columns(2)
+            if col_lb.button("Load", key="__load_btn__", use_container_width=True):
+                _load_scenario(load_pick)
+                st.rerun()
             if col_db.button("Delete", key="__del_btn__", use_container_width=True):
                 os.remove(os.path.join(SCENARIOS_DIR, f"{load_pick}.json"))
                 st.rerun()
-        else:
-            col_lb.button("Load", disabled=True, use_container_width=True)
-            col_db.button("Delete", disabled=True, use_container_width=True)
     else:
         st.caption("No saved scenarios yet")
     st.markdown("---")
     save_name = st.text_input("Save as", placeholder="scenario name", key="__save_name__")
     if st.button("Save current inputs", key="__save_btn__", disabled=not save_name.strip(), use_container_width=True):
         _save_scenario(save_name.strip())
-        st.sidebar.success(f"Saved: {save_name.strip()}")
+        st.success(f"Saved: {save_name.strip()}")
     st.markdown("---")
     uploaded = st.file_uploader("Upload scenario (.json)", type="json", key="__upload__", label_visibility="visible")
     if uploaded is not None:
-        try:
-            data = json.loads(uploaded.getvalue().decode("utf-8"))
-            for k, v in data.items():
-                st.session_state[k] = v
-            st.sidebar.success("Scenario loaded from file")
-        except Exception as e:
-            st.sidebar.error(f"Could not load file: {e}")
+        if st.button("Load uploaded file", key="__upload_load_btn__", use_container_width=True):
+            try:
+                data = json.loads(uploaded.getvalue().decode("utf-8"))
+                for k, v in data.items():
+                    st.session_state[k] = v
+                st.rerun()
+            except Exception as e:
+                st.error(f"Could not load file: {e}")
 
 # Section 0: Deal Strategy
 with st.sidebar.expander("🎯 Deal Strategy", expanded=True):
