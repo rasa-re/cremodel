@@ -1837,6 +1837,9 @@ with tab5:
     paydown_data = []
     for i in range(len(debt_df)):
         row = debt_df.iloc[i]
+        year_num = int(row['Year'])
+
+        # Determine starting balance
         if i == 0:
             if deal_strategy == "Bridge-to-Permanent (Value-Add)":
                 starting_balance = bridge_loan_amount
@@ -1846,11 +1849,31 @@ with tab5:
             starting_balance = debt_df.iloc[i-1]['Loan Balance']
 
         ending_balance = row['Loan Balance']
-        principal_paid = starting_balance - ending_balance
-        interest_paid = row['Debt Service'] - principal_paid if principal_paid >= 0 else row['Debt Service']
+
+        # Check if this is a refi year (loan balance increases)
+        is_refi_year = (ending_balance > starting_balance) if i > 0 else False
+
+        if is_refi_year:
+            # In refi year: calculate based on old loan, then reset for new loan
+            # The debt service shown is for the NEW loan (which started this year)
+            # Interest = new loan rate × new loan balance (for 1 year)
+            if deal_strategy == "Bridge-to-Permanent (Value-Add)" and year_num == refi_year:
+                # Bridge to perm: new perm loan started this year
+                interest_paid = ending_balance * (perm_rate / 100)
+            else:
+                # Buy-and-hold refi
+                interest_paid = ending_balance * (perm_rate / 100)
+
+            principal_paid = row['Debt Service'] - interest_paid
+            # Reset starting balance to new loan amount for display
+            starting_balance = ending_balance
+        else:
+            # Normal year: principal = starting - ending
+            principal_paid = starting_balance - ending_balance
+            interest_paid = row['Debt Service'] - principal_paid
 
         paydown_data.append({
-            'Year': int(row['Year']),
+            'Year': year_num,
             'Starting Balance': starting_balance,
             'Principal Paid': max(0, principal_paid),
             'Interest Paid': interest_paid,
