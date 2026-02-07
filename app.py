@@ -53,8 +53,6 @@ def _load_scenario(name):
         data = json.load(f)
     for k, v in data.items():
         st.session_state[k] = v
-    # Set flag to prevent auto-reset of bridge fields when loading bridge-to-perm scenario
-    st.session_state['_just_loaded_scenario'] = True
 
 # Page configuration
 st.set_page_config(
@@ -97,19 +95,12 @@ with st.sidebar.expander("💾 Scenarios", expanded=False):
                 data = json.loads(uploaded.getvalue().decode("utf-8"))
                 for k, v in data.items():
                     st.session_state[k] = v
-                # Set flag to prevent auto-reset of bridge fields when loading
-                st.session_state['_just_loaded_scenario'] = True
                 st.rerun()
             except Exception as e:
                 st.error(f"Could not load file: {e}")
 
 # Section 0: Deal Strategy
 with st.sidebar.expander("🎯 Deal Strategy", expanded=True):
-    # Detect strategy change and reset bridge fields if switching to buy-and-hold
-    prev_strategy = st.session_state.get('_prev_deal_strategy')
-    current_strategy = st.session_state.get('deal_strategy', "Buy-and-Hold with Permanent Financing")
-    just_loaded_scenario = st.session_state.get('_just_loaded_scenario', False)
-
     deal_strategy = st.radio(
         "Deal Structure:",
         options=[
@@ -119,27 +110,6 @@ with st.sidebar.expander("🎯 Deal Strategy", expanded=True):
         index=0,
         key="deal_strategy"
     )
-
-    # Only reset bridge fields if user manually changed strategy (not from scenario load)
-    if not just_loaded_scenario and prev_strategy == "Bridge-to-Permanent (Value-Add)" and deal_strategy == "Buy-and-Hold with Permanent Financing":
-        st.session_state['bridge_ltv'] = 0.0
-        st.session_state['bridge_rate'] = 0.0
-        st.session_state['bridge_term'] = 0
-        st.session_state['bridge_io'] = True
-        st.session_state['bridge_prepay_penalty'] = 0.0
-        st.session_state['bridge_orig_points'] = 0.0
-        st.session_state['value_add_capex'] = 0
-        st.session_state['value_add_year'] = 1
-        st.session_state['refi_year'] = 3
-        st.session_state['refi_legal_costs'] = 0
-        st.session_state['refi_cap_rate'] = 0.0
-        st.rerun()
-
-    # Track current strategy for next run
-    st.session_state['_prev_deal_strategy'] = deal_strategy
-    # Clear the flag after checking it
-    if just_loaded_scenario:
-        st.session_state['_just_loaded_scenario'] = False
 
     if deal_strategy == "Buy-and-Hold with Permanent Financing":
         st.info("**Standard stabilized asset**\n• Permanent loan at acquisition\n• Hold for cash flow\n• Exit via sale or refi")
@@ -264,6 +234,22 @@ with st.sidebar.expander("💰 Acquisition Costs"):
 # Section 3: Bridge Financing (only for value-add strategy)
 if deal_strategy == "Bridge-to-Permanent (Value-Add)":
     with st.sidebar.expander("🏦 Bridge Financing"):
+        # Checkbox to zero out all bridge financing
+        if st.button("🗑️ Clear All Bridge Financing", key="__clear_bridge__", use_container_width=True):
+            st.session_state['bridge_ltv'] = 0.0
+            st.session_state['bridge_rate'] = 0.0
+            st.session_state['bridge_term'] = 0
+            st.session_state['bridge_io'] = True
+            st.session_state['bridge_prepay_penalty'] = 0.0
+            st.session_state['bridge_orig_points'] = 0.0
+            st.session_state['value_add_capex'] = 0
+            st.session_state['value_add_year'] = 1
+            st.session_state['refi_year'] = 3
+            st.session_state['refi_legal_costs'] = 0
+            st.session_state['refi_cap_rate'] = 0.0
+            st.rerun()
+
+        st.markdown("---")
         bridge_ltv = st.number_input("Bridge Loan LTV (%)", value=75.0, step=1.0, max_value=100.0, key="bridge_ltv")
         bridge_rate = st.number_input("Bridge Interest Rate (%)", value=7.0, step=0.1, key="bridge_rate")
         bridge_term = st.number_input("Bridge Term (years)", value=2, step=1, max_value=5, key="bridge_term")
