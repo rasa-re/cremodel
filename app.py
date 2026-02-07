@@ -174,15 +174,15 @@ with st.sidebar.expander("📋 Current Lease", expanded=True):
     if rent_structure_type == "Fixed Bumps Every N Years":
         bump_frequency = st.number_input("Bump Every (years)", value=5, min_value=1, max_value=10, step=1, key="bump_frequency")
         bump_percentage = st.number_input("Bump Amount (%)", value=10.0, min_value=0.0, step=0.5, key="bump_percentage")
-        annual_escalator = 0.0
+        annual_escalator = st.session_state.get('annual_escalator', 0.0)
     elif rent_structure_type == "Annual Escalator (%)":
         annual_escalator = st.number_input("Annual Increase (%)", value=1.5, min_value=0.0, step=0.1, key="annual_escalator")
-        bump_frequency = 0
-        bump_percentage = 0.0
+        bump_frequency = st.session_state.get('bump_frequency', 0)
+        bump_percentage = st.session_state.get('bump_percentage', 0.0)
     else:  # Flat
-        bump_frequency = 0
-        bump_percentage = 0.0
-        annual_escalator = 0.0
+        bump_frequency = st.session_state.get('bump_frequency', 0)
+        bump_percentage = st.session_state.get('bump_percentage', 0.0)
+        annual_escalator = st.session_state.get('annual_escalator', 0.0)
 
 # Renegotiated lease (separate expander for clarity)
 with st.sidebar.expander("🔄 Lease Renegotiation"):
@@ -214,13 +214,13 @@ with st.sidebar.expander("🔄 Lease Renegotiation"):
 
         renego_new_term = st.number_input("New Term Length (years from renegotiation)", value=10, min_value=1, max_value=30, step=1, key="renego_new_term")
     else:
-        renego_year = 999
-        renego_rent = base_annual_rent
-        renego_structure = rent_structure_type
-        renego_bump_freq = bump_frequency
-        renego_bump_pct = bump_percentage
-        renego_escalator = annual_escalator
-        renego_new_term = 0
+        renego_year = st.session_state.get('renego_year', 999)
+        renego_rent = st.session_state.get('renego_rent', base_annual_rent)
+        renego_structure = st.session_state.get('renego_structure', rent_structure_type)
+        renego_bump_freq = st.session_state.get('renego_bump_freq', bump_frequency)
+        renego_bump_pct = st.session_state.get('renego_bump_pct', bump_percentage)
+        renego_escalator = st.session_state.get('renego_escalator', annual_escalator)
+        renego_new_term = st.session_state.get('renego_new_term', 0)
 
 # Section 2: Acquisition Costs
 with st.sidebar.expander("💰 Acquisition Costs"):
@@ -262,14 +262,15 @@ if deal_strategy == "Bridge-to-Permanent (Value-Add)":
         st.caption("Added to equity raise at close; spent in the selected year")
 else:
     # Default values for buy-and-hold (won't use bridge loan)
-    bridge_ltv = 0
-    bridge_rate = 0
-    bridge_term = 0
-    bridge_io = True
-    bridge_prepay_penalty = 0
-    bridge_orig_points = 0
-    value_add_capex = 0
-    value_add_year  = 1
+    # Read from session_state to preserve values if user switches between strategies
+    bridge_ltv = st.session_state.get('bridge_ltv', 0)
+    bridge_rate = st.session_state.get('bridge_rate', 0)
+    bridge_term = st.session_state.get('bridge_term', 0)
+    bridge_io = st.session_state.get('bridge_io', True)
+    bridge_prepay_penalty = st.session_state.get('bridge_prepay_penalty', 0)
+    bridge_orig_points = st.session_state.get('bridge_orig_points', 0)
+    value_add_capex = st.session_state.get('value_add_capex', 0)
+    value_add_year = st.session_state.get('value_add_year', 1)
 
 # Section 4: Permanent Financing
 with st.sidebar.expander("🏛️ Permanent Financing"):
@@ -298,18 +299,18 @@ with st.sidebar.expander("🏛️ Permanent Financing"):
         if refi_valuation_method == "Based on Cap Rate":
             refi_cap_rate = st.number_input("Refinance Cap Rate (%)", value=6.5, step=0.1, key="refi_cap_rate")
             st.caption("Lender will value property at NOI / Cap Rate")
-            fixed_refi_value = 0
-            appreciation_rate = 0
+            fixed_refi_value = st.session_state.get('fixed_refi_value', 0)
+            appreciation_rate = st.session_state.get('appreciation_rate', 0)
         elif refi_valuation_method == "Fixed Property Value":
             fixed_refi_value = st.number_input("Property Value at Refi ($)", value=5500000, step=100000, key="fixed_refi_value")
             st.caption("Enter appraised value")
-            refi_cap_rate = 0
-            appreciation_rate = 0
+            refi_cap_rate = st.session_state.get('refi_cap_rate', 0)
+            appreciation_rate = st.session_state.get('appreciation_rate', 0)
         else:  # Based on Original Purchase Price
             appreciation_rate = st.number_input("Appreciation Rate (% per year)", value=3.0, step=0.5, key="appreciation_rate")
             st.caption("Calculates: Value = Purchase Price × (1 + rate)^years")
-            refi_cap_rate = 0
-            fixed_refi_value = 0
+            refi_cap_rate = st.session_state.get('refi_cap_rate', 0)
+            fixed_refi_value = st.session_state.get('fixed_refi_value', 0)
 
         st.markdown("**Permanent Loan Constraints**")
         perm_ltv = st.number_input("Permanent LTV Target (%)", value=75.0, step=1.0, max_value=100.0, key="perm_ltv")
@@ -323,7 +324,7 @@ with st.sidebar.expander("🏛️ Permanent Financing"):
             max_cashout_pct = st.number_input("Maximum Cash-Out (% of equity gained)", value=80.0, step=5.0, max_value=100.0, key="max_cashout_pct")
             st.caption("Lenders typically limit cash-out to 80% of equity gained")
         else:
-            max_cashout_pct = 0
+            max_cashout_pct = st.session_state.get('max_cashout_pct', 0)
             st.caption("Refi will be used only to pay off bridge loan")
     else:
         # Buy-and-hold: permanent loan at acquisition
@@ -362,18 +363,18 @@ with st.sidebar.expander("🏛️ Permanent Financing"):
             if allow_cashout:
                 max_cashout_pct = st.number_input("Max Cash-Out (% of equity gained)", value=80.0, step=5.0, max_value=100.0, key="max_cashout_pct")
             else:
-                max_cashout_pct = 0
+                max_cashout_pct = st.session_state.get('max_cashout_pct', 0)
         else:
-            # No refi planned
+            # No refi planned - read from session_state to preserve values
             refi_year = 999  # Never
-            perm_orig_points = 0
-            refi_legal_costs = 0
-            refi_valuation_method = "Based on Cap Rate"
-            refi_cap_rate = 6.5
-            fixed_refi_value = 0
-            appreciation_rate = 0
-            allow_cashout = False
-            max_cashout_pct = 0
+            perm_orig_points = st.session_state.get('perm_orig_points', 0)
+            refi_legal_costs = st.session_state.get('refi_legal_costs', 0)
+            refi_valuation_method = st.session_state.get('refi_valuation_method', "Based on Cap Rate")
+            refi_cap_rate = st.session_state.get('refi_cap_rate', 6.5)
+            fixed_refi_value = st.session_state.get('fixed_refi_value', 0)
+            appreciation_rate = st.session_state.get('appreciation_rate', 0)
+            allow_cashout = st.session_state.get('allow_cashout', False)
+            max_cashout_pct = st.session_state.get('max_cashout_pct', 0)
 
 # Section 5: Annual Operating
 with st.sidebar.expander("⚙️ Annual Operating"):
