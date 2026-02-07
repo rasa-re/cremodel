@@ -597,10 +597,11 @@ with tab1:
                 new_loan_amount = refi_results['new_loan_amount']
                 perm_payment = calculate_perm_loan_payment(new_loan_amount, perm_rate, perm_amort)
 
-                # For simplicity, assume refi happens at year-end
-                # Pay bridge for this year, then switch to perm
-                debt_service = bridge_payment
-                loan_balance = new_loan_amount
+                # Refi happens at beginning of year - pay perm loan for full year
+                debt_service = perm_payment
+                loan_balance = calculate_perm_loan_balance(
+                    new_loan_amount, perm_rate, perm_amort, 1
+                )
                 refi_proceeds = refi_results['net_proceeds']
                 loan_type = "Bridge→Perm"
 
@@ -648,9 +649,11 @@ with tab1:
                 new_loan_amount = refi_results['new_loan_amount']
                 perm_payment = calculate_perm_loan_payment(new_loan_amount, perm_rate, perm_amort)
 
-                # Pay old perm loan for this year, then switch to new perm
-                debt_service = initial_debt_service
-                loan_balance = new_loan_amount
+                # Refi happens at beginning of year - pay new perm loan for full year
+                debt_service = perm_payment
+                loan_balance = calculate_perm_loan_balance(
+                    new_loan_amount, perm_rate, perm_amort, 1
+                )
                 refi_proceeds = refi_results['net_proceeds']
                 loan_type = "Perm Refi"
 
@@ -1519,8 +1522,8 @@ with tab4:
                         )
                         new_ln = refi_res['new_loan_amount']
                         pm = calculate_perm_loan_payment(new_ln, perm_rate_val, perm_amort_val)
-                        ds = bl_payment
-                        lb = new_ln
+                        ds = pm
+                        lb = calculate_perm_loan_balance(new_ln, perm_rate_val, perm_amort_val, 1)
                         rp = refi_res['net_proceeds']
                     else:
                         ds = pm
@@ -1538,8 +1541,8 @@ with tab4:
                         )
                         new_ln = refi_res['new_loan_amount']
                         pm = calculate_perm_loan_payment(new_ln, perm_rate_val, perm_amort_val)
-                        ds = init_ds
-                        lb = new_ln
+                        ds = pm
+                        lb = calculate_perm_loan_balance(new_ln, perm_rate_val, perm_amort_val, 1)
                         rp = refi_res['net_proceeds']
                     else:
                         ds = pm
