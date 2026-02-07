@@ -359,8 +359,8 @@ with st.sidebar.expander("🏛️ Permanent Financing"):
             allow_cashout = st.session_state.get('allow_cashout', False)
             max_cashout_pct = st.session_state.get('max_cashout_pct', 0)
 
-# Section 5: Annual Operating
-with st.sidebar.expander("⚙️ Annual Operating"):
+# Section 5: Non-Operating Expenses
+with st.sidebar.expander("⚙️ Non-Operating Expenses"):
     capex_reserve = st.number_input("Annual CapEx Reserve ($)", value=10000, step=1000, key="capex_reserve")
     asset_mgmt_pct = st.number_input("Asset Management Fee (% of LP equity)", value=1.5, step=0.1, key="asset_mgmt_pct")
     admin_costs = st.number_input("Annual Admin/Accounting ($)", value=5000, step=500, key="admin_costs")
