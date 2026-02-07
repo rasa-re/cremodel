@@ -599,6 +599,7 @@ with tab1:
 
                 # Refi happens at beginning of year - pay perm loan for full year
                 debt_service = perm_payment
+                # Ending balance after 1 year of payments
                 loan_balance = calculate_perm_loan_balance(
                     new_loan_amount, perm_rate, perm_amort, 1
                 )
@@ -606,11 +607,13 @@ with tab1:
                 loan_type = "Bridge→Perm"
 
             else:
-                # Permanent loan period
+                # Permanent loan period (years after refi)
                 debt_service = perm_payment
                 years_since_refi = year - refi_year
+                # Balance calculation: year - refi_year gives years AFTER refi year,
+                # but we need total years of payments (including refi year)
                 loan_balance = calculate_perm_loan_balance(
-                    new_loan_amount, perm_rate, perm_amort, years_since_refi
+                    new_loan_amount, perm_rate, perm_amort, years_since_refi + 1
                 )
                 loan_type = "Perm"
 
@@ -662,7 +665,7 @@ with tab1:
                 debt_service = perm_payment
                 years_since_refi = year - refi_year
                 loan_balance = calculate_perm_loan_balance(
-                    new_loan_amount, perm_rate, perm_amort, years_since_refi
+                    new_loan_amount, perm_rate, perm_amort, years_since_refi + 1
                 )
                 loan_type = "Perm"
 
@@ -1527,7 +1530,7 @@ with tab4:
                         rp = refi_res['net_proceeds']
                     else:
                         ds = pm
-                        lb = calculate_perm_loan_balance(new_ln, perm_rate_val, perm_amort_val, year - refi_yr)
+                        lb = calculate_perm_loan_balance(new_ln, perm_rate_val, perm_amort_val, year - refi_yr + 1)
                 else:
                     if year < refi_yr or refi_yr == 999:
                         ds = init_ds
@@ -1546,7 +1549,7 @@ with tab4:
                         rp = refi_res['net_proceeds']
                     else:
                         ds = pm
-                        lb = calculate_perm_loan_balance(new_ln, perm_rate_val, perm_amort_val, year - refi_yr)
+                        lb = calculate_perm_loan_balance(new_ln, perm_rate_val, perm_amort_val, year - refi_yr + 1)
 
                 amf = lp_eq * (asset_mgmt_p / 100)
                 opex = capex_res + amf + admin_c
