@@ -231,6 +231,12 @@ with st.sidebar.expander("💰 Acquisition Costs"):
         perm_orig_points_acq = st.number_input("Perm Loan Origination (points)", value=1.5, step=0.1, key="perm_orig_points_acq")
     acquisition_fee_pct = st.number_input("Acquisition Fee to GP (% of purchase)", value=1.5, step=0.1, key="acquisition_fee_pct")
 
+# Section 2b: Capital Expenditures
+with st.sidebar.expander("🔧 Capital Expenditures"):
+    value_add_capex = st.number_input("CapEx Amount ($)", value=0, step=25000, key="value_add_capex")
+    value_add_year = st.number_input("Spend in Year", value=1, min_value=1, max_value=10, step=1, key="value_add_year")
+    st.caption("Added to equity raise at close; spent in the selected year")
+
 # Section 3: Bridge Financing (only for value-add strategy)
 if deal_strategy == "Bridge-to-Permanent (Value-Add)":
     with st.sidebar.expander("🏦 Bridge Financing"):
@@ -238,12 +244,10 @@ if deal_strategy == "Bridge-to-Permanent (Value-Add)":
         if st.button("🗑️ Clear All Bridge Financing", key="__clear_bridge__", use_container_width=True):
             st.session_state['bridge_ltv'] = 0.0
             st.session_state['bridge_rate'] = 0.0
-            st.session_state['bridge_term'] = 0
+            st.session_state['bridge_term'] = 1  # Min 1 to avoid errors
             st.session_state['bridge_io'] = True
             st.session_state['bridge_prepay_penalty'] = 0.0
             st.session_state['bridge_orig_points'] = 0.0
-            st.session_state['value_add_capex'] = 0
-            st.session_state['value_add_year'] = 1
             st.session_state['refi_year'] = 3
             st.session_state['refi_legal_costs'] = 0
             st.session_state['refi_cap_rate'] = 0.0
@@ -252,14 +256,9 @@ if deal_strategy == "Bridge-to-Permanent (Value-Add)":
         st.markdown("---")
         bridge_ltv = st.number_input("Bridge Loan LTV (%)", value=75.0, step=1.0, max_value=100.0, key="bridge_ltv")
         bridge_rate = st.number_input("Bridge Interest Rate (%)", value=7.0, step=0.1, key="bridge_rate")
-        bridge_term = st.number_input("Bridge Term (years)", value=2, step=1, max_value=5, key="bridge_term")
+        bridge_term = st.number_input("Bridge Term (years)", value=2, step=1, min_value=1, max_value=5, key="bridge_term")
         bridge_io = st.checkbox("Interest Only?", value=True, key="bridge_io")
         bridge_prepay_penalty = st.number_input("Prepayment Penalty (%)", value=2.0, step=0.1, key="bridge_prepay_penalty")
-
-        st.markdown("**Value-Add Capital**")
-        value_add_capex = st.number_input("Value-Add CapEx ($)", value=0, step=25000, key="value_add_capex")
-        value_add_year  = st.number_input("Spend in Year", value=1, min_value=1, max_value=5, step=1, key="value_add_year")
-        st.caption("Added to equity raise at close; spent in the selected year")
 else:
     # Default values for buy-and-hold (won't use bridge loan)
     # Read from session_state to preserve values if user switches between strategies
@@ -269,8 +268,6 @@ else:
     bridge_io = st.session_state.get('bridge_io', True)
     bridge_prepay_penalty = st.session_state.get('bridge_prepay_penalty', 0)
     bridge_orig_points = st.session_state.get('bridge_orig_points', 0)
-    value_add_capex = st.session_state.get('value_add_capex', 0)
-    value_add_year = st.session_state.get('value_add_year', 1)
 
 # Section 4: Permanent Financing
 with st.sidebar.expander("🏛️ Permanent Financing"):
