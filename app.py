@@ -101,6 +101,10 @@ with st.sidebar.expander("💾 Scenarios", expanded=False):
 
 # Section 0: Deal Strategy
 with st.sidebar.expander("🎯 Deal Strategy", expanded=True):
+    # Detect strategy change and reset bridge fields if switching to buy-and-hold
+    prev_strategy = st.session_state.get('_prev_deal_strategy')
+    current_strategy = st.session_state.get('deal_strategy', "Buy-and-Hold with Permanent Financing")
+
     deal_strategy = st.radio(
         "Deal Structure:",
         options=[
@@ -110,6 +114,24 @@ with st.sidebar.expander("🎯 Deal Strategy", expanded=True):
         index=0,
         key="deal_strategy"
     )
+
+    # If user just switched from bridge-to-perm to buy-and-hold, zero out bridge fields
+    if prev_strategy == "Bridge-to-Permanent (Value-Add)" and deal_strategy == "Buy-and-Hold with Permanent Financing":
+        st.session_state['bridge_ltv'] = 0.0
+        st.session_state['bridge_rate'] = 0.0
+        st.session_state['bridge_term'] = 0
+        st.session_state['bridge_io'] = True
+        st.session_state['bridge_prepay_penalty'] = 0.0
+        st.session_state['bridge_orig_points'] = 0.0
+        st.session_state['value_add_capex'] = 0
+        st.session_state['value_add_year'] = 1
+        st.session_state['refi_year'] = 3
+        st.session_state['refi_legal_costs'] = 0
+        st.session_state['refi_cap_rate'] = 0.0
+        st.rerun()
+
+    # Track current strategy for next run
+    st.session_state['_prev_deal_strategy'] = deal_strategy
 
     if deal_strategy == "Buy-and-Hold with Permanent Financing":
         st.info("**Standard stabilized asset**\n• Permanent loan at acquisition\n• Hold for cash flow\n• Exit via sale or refi")
