@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import json, os, glob as glob_mod
-from calculations.cash_flows import (calculate_sources, calculate_noi_projection_with_lease)
+from calculations.cash_flows import (calculate_sources, calculate_noi_projection_with_lease, calculate_multi_tenant_noi)
 from calculations.financing import (calculate_bridge_loan_payment, calculate_bridge_loan_balance, calculate_dscr,
                                    calculate_perm_loan_payment, calculate_perm_loan_balance, calculate_refinance,
                                    check_refi_feasibility_with_lease)
@@ -17,6 +17,7 @@ SCENARIO_KEYS = [
     "tenant_name", "property_type", "property_sqft", "year_built",
     "purchase_price", "exit_strategy", "holding_period",
     "refi_year_buyhold", "continue_after_refi", "additional_years",
+    "tenants",  # Multi-tenant list
     "current_term_remaining_input", "years_elapsed",
     "num_renewal_options", "option_term_years",
     "base_annual_rent", "rent_structure_type",
@@ -63,6 +64,7 @@ st.set_page_config(
 
 st.title("🏢 Commercial Real Estate Underwriting Model")
 st.markdown("**Net Lease Property Analysis with Investor Waterfall**")
+st.caption("Version 2.0 (Multi-Tenant) - Work in Progress")
 
 # SIDEBAR INPUTS
 st.sidebar.title("Deal Inputs")
@@ -152,75 +154,136 @@ with st.sidebar.expander("🏠 Deal Assumptions", expanded=True):
         # Bridge-to-perm strategy
         holding_period = st.selectbox("Total Hold Period (years)", options=[3, 5, 7, 10], index=1, key="holding_period")
 
-# Section 1b: Lease Structure
-with st.sidebar.expander("📋 Current Lease", expanded=True):
-    st.markdown("**Lease Term**")
-    current_term_remaining_input = st.number_input("Years Remaining on Current Term", value=7, min_value=0, max_value=30, step=1, key="current_term_remaining_input")
-    years_elapsed = st.number_input("Years Into Original Lease", value=8, min_value=0, max_value=30, step=1, key="years_elapsed")
-    st.caption("Used to align rent bump timing with original lease commencement")
+# Section 1b: Multi-Tenant Structure
+with st.sidebar.expander("🏢 Tenants", expanded=True):
+    # Initialize tenant list in session state
+    if 'tenants' not in st.session_state:
+        st.session_state['tenants'] = [
+            {
+                'id': 0,
+                'name': 'Tenant 1',
+                'sqft': 10000,
+                'annual_rent': 250000,
+                'lease_expiration_year': 7,
+                'years_elapsed': 8,
+                'renewal_options': 3,
+                'option_term': 5,
+                'escalation_type': 'Fixed Bumps Every N Years',
+                'bump_frequency': 5,
+                'bump_percentage': 10.0,
+                'annual_escalator': 0.0,
+                'status': 'Occupied'
+            }
+        ]
 
-    st.markdown("**Renewal Options**")
-    num_renewal_options = st.number_input("Number of Renewal Options Available", value=3, min_value=0, max_value=5, step=1, key="num_renewal_options")
-    option_term_years = st.number_input("Each Option Term (years)", value=5, min_value=1, max_value=10, step=1, key="option_term_years")
+    # Buttons to add/remove tenants
+    col1, col2 = st.columns(2)
+    if col1.button("➕ Add Tenant", use_container_width=True):
+        new_id = max([t['id'] for t in st.session_state['tenants']]) + 1 if st.session_state['tenants'] else 0
+        st.session_state['tenants'].append({
+            'id': new_id,
+            'name': f'Tenant {new_id + 1}',
+            'sqft': 5000,
+            'annual_rent': 100000,
+            'lease_expiration_year': 5,
+            'years_elapsed': 0,
+            'renewal_options': 2,
+            'option_term': 5,
+            'escalation_type': 'Fixed Bumps Every N Years',
+            'bump_frequency': 5,
+            'bump_percentage': 10.0,
+            'annual_escalator': 0.0,
+            'status': 'Occupied'
+        })
+        st.rerun()
 
-    st.markdown("**Current Rent & Escalation**")
-    base_annual_rent = st.number_input("Current Base Rent ($)", value=250000, step=10000, key="base_annual_rent")
-    rent_structure_type = st.selectbox("Escalation Type", options=[
-        "Fixed Bumps Every N Years",
-        "Annual Escalator (%)",
-        "Flat (No Increases)"
-    ], index=0, key="rent_structure_type")
+    if col2.button("➖ Remove Last", use_container_width=True, disabled=len(st.session_state['tenants']) <= 1):
+        st.session_state['tenants'].pop()
+        st.rerun()
 
-    if rent_structure_type == "Fixed Bumps Every N Years":
-        bump_frequency = st.number_input("Bump Every (years)", value=5, min_value=1, max_value=10, step=1, key="bump_frequency")
-        bump_percentage = st.number_input("Bump Amount (%)", value=10.0, min_value=0.0, step=0.5, key="bump_percentage")
-        annual_escalator = st.session_state.get('annual_escalator', 0.0)
-    elif rent_structure_type == "Annual Escalator (%)":
-        annual_escalator = st.number_input("Annual Increase (%)", value=1.5, min_value=0.0, step=0.1, key="annual_escalator")
-        bump_frequency = st.session_state.get('bump_frequency', 0)
-        bump_percentage = st.session_state.get('bump_percentage', 0.0)
-    else:  # Flat
-        bump_frequency = st.session_state.get('bump_frequency', 0)
-        bump_percentage = st.session_state.get('bump_percentage', 0.0)
-        annual_escalator = st.session_state.get('annual_escalator', 0.0)
+    st.markdown("---")
 
-# Renegotiated lease (separate expander for clarity)
-with st.sidebar.expander("🔄 Lease Renegotiation"):
-    renegotiate_lease = st.checkbox("Model a Lease Renegotiation", value=False, key="renegotiate_lease")
-    if renegotiate_lease:
-        renego_year = st.number_input("Renegotiation Happens in Year", value=3, min_value=1, max_value=20, step=1, key="renego_year")
-        st.caption("New terms apply from this year onward")
+    # Display each tenant's inputs
+    for i, tenant in enumerate(st.session_state['tenants']):
+        with st.expander(f"📋 {tenant['name']}", expanded=(i == 0)):
+            tenant['name'] = st.text_input("Tenant Name", value=tenant['name'], key=f"tenant_name_{tenant['id']}")
+            tenant['status'] = st.selectbox("Status", options=['Occupied', 'Vacant'], index=0 if tenant['status'] == 'Occupied' else 1, key=f"tenant_status_{tenant['id']}")
 
-        renego_rent = st.number_input("New Base Rent ($)", value=base_annual_rent, step=10000, key="renego_rent")
+            if tenant['status'] == 'Occupied':
+                tenant['sqft'] = st.number_input("Square Footage", value=tenant['sqft'], step=100, min_value=0, key=f"tenant_sqft_{tenant['id']}")
+                tenant['annual_rent'] = st.number_input("Annual Rent ($)", value=tenant['annual_rent'], step=10000, min_value=0, key=f"tenant_rent_{tenant['id']}")
 
-        renego_structure = st.selectbox("New Escalation Type", options=[
-            "Fixed Bumps Every N Years",
-            "Annual Escalator (%)",
-            "Flat (No Increases)"
-        ], index=0, key="renego_structure")
+                st.markdown("**Lease Terms**")
+                tenant['lease_expiration_year'] = st.number_input("Years Until Lease Expires", value=tenant['lease_expiration_year'], min_value=0, max_value=30, step=1, key=f"tenant_exp_{tenant['id']}")
+                tenant['years_elapsed'] = st.number_input("Years Into Current Lease", value=tenant['years_elapsed'], min_value=0, max_value=30, step=1, key=f"tenant_elapsed_{tenant['id']}")
+                tenant['renewal_options'] = st.number_input("Renewal Options", value=tenant['renewal_options'], min_value=0, max_value=5, step=1, key=f"tenant_renewals_{tenant['id']}")
+                tenant['option_term'] = st.number_input("Option Term (years)", value=tenant['option_term'], min_value=1, max_value=10, step=1, key=f"tenant_opt_term_{tenant['id']}")
 
-        if renego_structure == "Fixed Bumps Every N Years":
-            renego_bump_freq = st.number_input("New Bump Every (years)", value=5, min_value=1, max_value=10, step=1, key="renego_bump_freq")
-            renego_bump_pct = st.number_input("New Bump Amount (%)", value=10.0, min_value=0.0, step=0.5, key="renego_bump_pct")
-            renego_escalator = 0.0
-        elif renego_structure == "Annual Escalator (%)":
-            renego_escalator = st.number_input("New Annual Increase (%)", value=2.0, min_value=0.0, step=0.1, key="renego_escalator")
-            renego_bump_freq = 0
-            renego_bump_pct = 0.0
-        else:
-            renego_bump_freq = 0
-            renego_bump_pct = 0.0
-            renego_escalator = 0.0
+                st.markdown("**Rent Escalation**")
+                tenant['escalation_type'] = st.selectbox("Escalation Type", options=[
+                    "Fixed Bumps Every N Years",
+                    "Annual Escalator (%)",
+                    "Flat (No Increases)"
+                ], index=['Fixed Bumps Every N Years', 'Annual Escalator (%)', 'Flat (No Increases)'].index(tenant['escalation_type']), key=f"tenant_esc_type_{tenant['id']}")
 
-        renego_new_term = st.number_input("New Term Length (years from renegotiation)", value=10, min_value=1, max_value=30, step=1, key="renego_new_term")
-    else:
-        renego_year = st.session_state.get('renego_year', 999)
-        renego_rent = st.session_state.get('renego_rent', base_annual_rent)
-        renego_structure = st.session_state.get('renego_structure', rent_structure_type)
-        renego_bump_freq = st.session_state.get('renego_bump_freq', bump_frequency)
-        renego_bump_pct = st.session_state.get('renego_bump_pct', bump_percentage)
-        renego_escalator = st.session_state.get('renego_escalator', annual_escalator)
-        renego_new_term = st.session_state.get('renego_new_term', 0)
+                if tenant['escalation_type'] == "Fixed Bumps Every N Years":
+                    tenant['bump_frequency'] = st.number_input("Bump Every (years)", value=tenant['bump_frequency'], min_value=1, max_value=10, step=1, key=f"tenant_bump_freq_{tenant['id']}")
+                    tenant['bump_percentage'] = st.number_input("Bump Amount (%)", value=tenant['bump_percentage'], min_value=0.0, step=0.5, key=f"tenant_bump_pct_{tenant['id']}")
+                    tenant['annual_escalator'] = 0.0
+                elif tenant['escalation_type'] == "Annual Escalator (%)":
+                    tenant['annual_escalator'] = st.number_input("Annual Increase (%)", value=tenant.get('annual_escalator', 1.5), min_value=0.0, step=0.1, key=f"tenant_ann_esc_{tenant['id']}")
+                    tenant['bump_frequency'] = 0
+                    tenant['bump_percentage'] = 0.0
+                else:
+                    tenant['bump_frequency'] = 0
+                    tenant['bump_percentage'] = 0.0
+                    tenant['annual_escalator'] = 0.0
+            else:
+                # Vacant tenant
+                tenant['sqft'] = st.number_input("Square Footage", value=tenant['sqft'], step=100, min_value=0, key=f"tenant_sqft_{tenant['id']}")
+                tenant['annual_rent'] = 0
+                tenant['lease_expiration_year'] = 0
+                tenant['years_elapsed'] = 0
+                tenant['renewal_options'] = 0
+                tenant['option_term'] = 0
+                tenant['bump_frequency'] = 0
+                tenant['bump_percentage'] = 0.0
+                tenant['annual_escalator'] = 0.0
+
+# Store aggregated values for backward compatibility with existing calculations
+# (We'll update the NOI calculation to use the tenant list directly)
+base_annual_rent = sum([t['annual_rent'] for t in st.session_state['tenants']])
+property_sqft = sum([t['sqft'] for t in st.session_state['tenants']])
+# For single-tenant compatibility, use first tenant's lease terms
+if st.session_state['tenants']:
+    first_tenant = st.session_state['tenants'][0]
+    current_term_remaining_input = first_tenant['lease_expiration_year']
+    years_elapsed = first_tenant['years_elapsed']
+    num_renewal_options = first_tenant['renewal_options']
+    option_term_years = first_tenant['option_term']
+    rent_structure_type = first_tenant['escalation_type']
+    bump_frequency = first_tenant['bump_frequency']
+    bump_percentage = first_tenant['bump_percentage']
+    annual_escalator = first_tenant['annual_escalator']
+else:
+    current_term_remaining_input = 0
+    years_elapsed = 0
+    num_renewal_options = 0
+    option_term_years = 5
+    rent_structure_type = "Flat (No Increases)"
+    bump_frequency = 0
+    bump_percentage = 0.0
+    annual_escalator = 0.0
+
+# Remove lease renegotiation for now in multi-tenant (can add per-tenant renegotiation later)
+renegotiate_lease = False
+renego_year = 999
+renego_rent = base_annual_rent
+renego_structure = rent_structure_type
+renego_bump_freq = bump_frequency
+renego_bump_pct = bump_percentage
+renego_escalator = annual_escalator
+renego_new_term = 0
 
 # Section 2: Acquisition Costs
 with st.sidebar.expander("💰 Acquisition Costs"):
@@ -462,36 +525,8 @@ with tab1:
 
     st.markdown("---")
 
-    # Calculate NOI projection -- handles renegotiation by running two segments
-    if renegotiate_lease and renego_year <= holding_period:
-        # Segment 1: current lease terms up to renegotiation year
-        noi_df_pre = calculate_noi_projection_with_lease(
-            base_annual_rent, rent_structure_type, bump_frequency,
-            bump_percentage, annual_escalator, renego_year - 1,
-            runway['current_term_remaining'], runway['max_total_runway'], years_elapsed
-        )
-
-        # Segment 2: new lease terms from renegotiation onward
-        # years_elapsed for new lease = 0 (fresh lease commencement at renegotiation)
-        years_post_renego = holding_period - (renego_year - 1)
-        noi_df_post = calculate_noi_projection_with_lease(
-            renego_rent, renego_structure, renego_bump_freq,
-            renego_bump_pct, renego_escalator, years_post_renego,
-            renego_new_term, renego_new_term, 0  # fresh lease start
-        )
-        # Re-index post segment years to continue from renego_year
-        noi_df_post['Year'] = noi_df_post['Year'] + (renego_year - 1)
-        noi_df_post['Lease Status'] = noi_df_post['Lease Status'].apply(
-            lambda s: f"Renegotiated ({s})"
-        )
-
-        noi_df = pd.concat([noi_df_pre, noi_df_post], ignore_index=True)
-    else:
-        noi_df = calculate_noi_projection_with_lease(
-            base_annual_rent, rent_structure_type, bump_frequency,
-            bump_percentage, annual_escalator, holding_period,
-            runway['current_term_remaining'], runway['max_total_runway'], years_elapsed
-        )
+    # Calculate NOI projection using multi-tenant model
+    noi_df = calculate_multi_tenant_noi(st.session_state['tenants'], holding_period)
 
     # Initialize variables
     refi_results = None

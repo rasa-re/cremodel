@@ -142,3 +142,71 @@ def calculate_sources(purchase_price, bridge_ltv, lp_equity, gp_equity, closing_
         'equity_needed': total_equity_needed,
         'uses': costs
     }
+
+def calculate_multi_tenant_noi(tenants_list, holding_period):
+    """
+    Calculate aggregate NOI projection for multi-tenant property.
+
+    Parameters:
+    - tenants_list: list of tenant dicts with lease terms and escalations
+    - holding_period: number of years to project
+
+    Returns: DataFrame with Year, NOI, Lease Status columns
+    """
+    noi_schedule = []
+
+    for year in range(1, holding_period + 1):
+        total_rent = 0
+        lease_statuses = []
+
+        for tenant in tenants_list:
+            if tenant['status'] == 'Vacant':
+                lease_statuses.append(f"{tenant['name']}: Vacant")
+                continue
+
+            # Check if tenant lease has expired
+            if year > tenant['lease_expiration_year']:
+                # Check if renewal options are available
+                years_past_expiration = year - tenant['lease_expiration_year']
+                option_number = (years_past_expiration - 1) // tenant['option_term'] + 1
+
+                if option_number <= tenant['renewal_options']:
+                    # In renewal option period
+                    lease_statuses.append(f"{tenant['name']}: Option {option_number}")
+                else:
+                    # No more options, lease expired
+                    lease_statuses.append(f"{tenant['name']}: EXPIRED")
+                    continue
+            else:
+                lease_statuses.append(f"{tenant['name']}: Active")
+
+            # Calculate rent for this year based on escalation
+            base_rent = tenant['annual_rent']
+            escalation_type = tenant['escalation_type']
+
+            # Calculate years since lease start for escalation
+            years_since_start = tenant['years_elapsed'] + year - 1
+
+            if escalation_type == "Fixed Bumps Every N Years":
+                bump_freq = tenant['bump_frequency']
+                bump_pct = tenant['bump_percentage']
+                if bump_freq > 0:
+                    num_bumps = years_since_start // bump_freq
+                    current_rent = base_rent * ((1 + bump_pct/100) ** num_bumps)
+                else:
+                    current_rent = base_rent
+            elif escalation_type == "Annual Escalator (%)":
+                ann_esc = tenant['annual_escalator']
+                current_rent = base_rent * ((1 + ann_esc/100) ** years_since_start)
+            else:  # Flat
+                current_rent = base_rent
+
+            total_rent += current_rent
+
+        noi_schedule.append({
+            'Year': year,
+            'NOI': total_rent,
+            'Lease Status': " | ".join(lease_statuses) if lease_statuses else "All Vacant"
+        })
+
+    return pd.DataFrame(noi_schedule)
