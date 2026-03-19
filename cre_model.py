@@ -2,21 +2,26 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import json, os, glob as glob_mod
-from calculations.cash_flows import (calculate_sources, calculate_noi_projection_with_lease)
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from calculations.cash_flows import (calculate_sources, calculate_noi_projection_with_lease, calculate_multi_tenant_noi)
 from calculations.financing import (calculate_bridge_loan_payment, calculate_bridge_loan_balance, calculate_dscr,
                                    calculate_perm_loan_payment, calculate_perm_loan_balance, calculate_refinance,
-                                   check_refi_feasibility_with_lease)
+                                   check_refi_feasibility_with_lease, calculate_irr)
 from calculations.distributions import (calculate_multi_year_waterfall)
 
 # --- Scenario persistence helpers ---
-SCENARIOS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scenarios")
+# Shared scenarios dir — CRE Scout writes, CRE Model reads
+SCENARIOS_DIR = os.path.join(os.path.expanduser("~"), "Documents", "python", "projects", "CRE", "scenarios")
 os.makedirs(SCENARIOS_DIR, exist_ok=True)
+SHARED_SCENARIOS_DIR = SCENARIOS_DIR
 
 SCENARIO_KEYS = [
     "deal_strategy", "property_name", "property_address", "property_city_state",
     "tenant_name", "property_type", "property_sqft", "year_built",
     "purchase_price", "exit_strategy", "holding_period",
     "refi_year_buyhold", "continue_after_refi", "additional_years",
+    "tenants",  # Multi-tenant list
     "current_term_remaining_input", "years_elapsed",
     "num_renewal_options", "option_term_years",
     "base_annual_rent", "rent_structure_type",
@@ -30,58 +35,82 @@ SCENARIO_KEYS = [
     "refi_valuation_method", "refi_cap_rate", "fixed_refi_value", "appreciation_rate",
     "perm_ltv", "target_dscr", "use_conservative",
     "allow_cashout", "max_cashout_pct",
-    "capex_reserve", "prop_mgmt_pct", "admin_costs",
-    "lp_equity_pct", "pref_rate", "gp_profit_share", "include_catchup",
+    "vacancy_credit_loss_pct", "capex_reserve", "asset_mgmt_pct", "admin_costs",
+    "lp_equity_pct", "pref_rate", "pref_on_unreturned", "gp_profit_share", "include_catchup",
     "promote_mode", "promote_hurdle_irr", "gp_promote_share", "lp_irr_cap",
-    "exit_cap_rate", "broker_commission_pct", "exit_legal_pct", "disposition_fee_pct",
+    "exit_cap_rate", "use_forward_noi", "broker_commission_pct", "exit_legal_pct", "disposition_fee_pct",
+    "refi_prorata",
+    "marginal_tax_rate", "cap_gains_rate", "depreciation_recapture_rate",
+    "land_allocation_pct", "depreciation_method", "cost_seg_5yr", "cost_seg_15yr",
     "deal_name",
 ]
 
 def _list_scenarios():
-    return sorted([os.path.splitext(os.path.basename(f))[0]
-                   for f in glob_mod.glob(os.path.join(SCENARIOS_DIR, "*.json"))])
+    # Pull from both local and shared dirs
+    files = set()
+    for d in [SCENARIOS_DIR, SHARED_SCENARIOS_DIR]:
+        files.update(glob_mod.glob(os.path.join(d, "*.json")))
+    return sorted([os.path.splitext(os.path.basename(f))[0] for f in files])
 
 def _save_scenario(name):
     data = {k: st.session_state.get(k) for k in SCENARIO_KEYS if k in st.session_state}
-    # Add multi-tenant data
-    data['multi_tenant_mode'] = st.session_state.get('multi_tenant_mode', False)
-    data['tenants'] = st.session_state.get('tenants', [])
-    data['next_tenant_id'] = st.session_state.get('next_tenant_id', 2)
-    # Add tenant 1 data if in multi-tenant mode
-    if st.session_state.get('multi_tenant_mode', False):
-        t1_keys = ['t1_pct', 't1_rent', 't1_structure', 't1_bump_freq', 't1_bump_pct', 't1_escalator', 't1_term']
-        for k in t1_keys:
-            if k in st.session_state:
-                data[k] = st.session_state[k]
-
     path = os.path.join(SCENARIOS_DIR, f"{name}.json")
     with open(path, "w") as f:
         json.dump(data, f, indent=2, default=str)
 
+def _apply_tenant_widget_keys(tenants):
+    """Sync loaded tenant data into widget-keyed session state so widgets display correct values."""
+    for tenant in tenants:
+        tid = tenant['id']
+        if 'name' in tenant:
+            st.session_state[f'tenant_name_{tid}'] = str(tenant['name'])
+        if 'status' in tenant:
+            st.session_state[f'tenant_status_{tid}'] = tenant['status']
+        if 'sqft' in tenant:
+            st.session_state[f'tenant_sqft_{tid}'] = int(tenant['sqft'])
+        if 'annual_rent' in tenant:
+            st.session_state[f'tenant_rent_{tid}'] = int(tenant['annual_rent'])
+        if 'lease_expiration_year' in tenant:
+            st.session_state[f'tenant_exp_{tid}'] = float(tenant['lease_expiration_year'])
+        if 'years_elapsed' in tenant:
+            st.session_state[f'tenant_elapsed_{tid}'] = int(tenant['years_elapsed'])
+        if 'renewal_options' in tenant:
+            st.session_state[f'tenant_renewals_{tid}'] = int(tenant['renewal_options'])
+        if 'option_term' in tenant:
+            st.session_state[f'tenant_opt_term_{tid}'] = int(tenant['option_term'])
+        if 'escalation_type' in tenant:
+            st.session_state[f'tenant_esc_type_{tid}'] = tenant['escalation_type']
+        if tenant.get('escalation_type') == 'Fixed Bumps Every N Years':
+            if 'bump_frequency' in tenant:
+                st.session_state[f'tenant_bump_freq_{tid}'] = int(max(1, tenant['bump_frequency']))
+            if 'bump_percentage' in tenant:
+                st.session_state[f'tenant_bump_pct_{tid}'] = float(tenant['bump_percentage'])
+        elif tenant.get('escalation_type') == 'Annual Escalator (%)':
+            if 'annual_escalator' in tenant:
+                st.session_state[f'tenant_ann_esc_{tid}'] = float(tenant['annual_escalator'])
+
 def _load_scenario(name):
-    path = os.path.join(SCENARIOS_DIR, f"{name}.json")
+    # Check shared dir first, then local
+    path = os.path.join(SHARED_SCENARIOS_DIR, f"{name}.json")
+    if not os.path.exists(path):
+        path = os.path.join(SCENARIOS_DIR, f"{name}.json")
     with open(path) as f:
         data = json.load(f)
     for k, v in data.items():
         st.session_state[k] = v
+    if 'tenants' in data:
+        _apply_tenant_widget_keys(data['tenants'])
 
 # Page configuration
 st.set_page_config(
-    page_title="CRE Underwriting Model",
-    page_icon="🏢",
+    page_title="CRE Model",
+    page_icon="📊",
     layout="wide"
 )
 
-st.title("🏢 Commercial Real Estate Underwriting Model")
-st.markdown("**Net Lease Property Analysis with Investor Waterfall**")
-
-# Initialize multi-tenant list in session state
-if 'tenants' not in st.session_state:
-    st.session_state.tenants = []
-if 'next_tenant_id' not in st.session_state:
-    st.session_state.next_tenant_id = 2  # ID 1 reserved for original tenant
-if 'multi_tenant_mode' not in st.session_state:
-    st.session_state.multi_tenant_mode = False
+st.title("CRE Model")
+st.markdown("**Net Lease Underwriting — Cash Flow, Financing & Waterfall**")
+st.caption("v2.0 Multi-Tenant")
 
 # SIDEBAR INPUTS
 st.sidebar.title("Deal Inputs")
@@ -114,6 +143,8 @@ with st.sidebar.expander("💾 Scenarios", expanded=False):
                 data = json.loads(uploaded.getvalue().decode("utf-8"))
                 for k, v in data.items():
                     st.session_state[k] = v
+                if 'tenants' in data:
+                    _apply_tenant_widget_keys(data['tenants'])
                 st.rerun()
             except Exception as e:
                 st.error(f"Could not load file: {e}")
@@ -171,186 +202,155 @@ with st.sidebar.expander("🏠 Deal Assumptions", expanded=True):
         # Bridge-to-perm strategy
         holding_period = st.selectbox("Total Hold Period (years)", options=[3, 5, 7, 10], index=1, key="holding_period")
 
-# Section 1b: Lease Structure
-with st.sidebar.expander("📋 Current Lease", expanded=True):
-    st.markdown("**Lease Term**")
-    current_term_remaining_input = st.number_input("Years Remaining on Current Term", value=7, min_value=0, max_value=30, step=1, key="current_term_remaining_input")
-    years_elapsed = st.number_input("Years Into Original Lease", value=8, min_value=0, max_value=30, step=1, key="years_elapsed")
-    st.caption("Used to align rent bump timing with original lease commencement")
+# Section 1b: Multi-Tenant Structure
+with st.sidebar.expander("🏢 Tenants", expanded=True):
+    # Initialize tenant list in session state
+    if 'tenants' not in st.session_state:
+        st.session_state['tenants'] = [
+            {
+                'id': 0,
+                'name': 'Tenant 1',
+                'sqft': 10000,
+                'annual_rent': 250000,
+                'lease_expiration_year': 7,
+                'years_elapsed': 8,
+                'renewal_options': 3,
+                'option_term': 5,
+                'escalation_type': 'Fixed Bumps Every N Years',
+                'bump_frequency': 5,
+                'bump_percentage': 10.0,
+                'annual_escalator': 0.0,
+                'status': 'Occupied'
+            }
+        ]
 
-    st.markdown("**Renewal Options**")
-    num_renewal_options = st.number_input("Number of Renewal Options Available", value=3, min_value=0, max_value=5, step=1, key="num_renewal_options")
-    option_term_years = st.number_input("Each Option Term (years)", value=5, min_value=1, max_value=10, step=1, key="option_term_years")
+    # Buttons to add/remove tenants
+    col1, col2 = st.columns(2)
+    if col1.button("➕ Add Tenant", use_container_width=True):
+        new_id = max([t['id'] for t in st.session_state['tenants']]) + 1 if st.session_state['tenants'] else 0
+        st.session_state['tenants'].append({
+            'id': new_id,
+            'name': f'Tenant {new_id + 1}',
+            'sqft': 5000,
+            'annual_rent': 100000,
+            'lease_expiration_year': 5,
+            'years_elapsed': 0,
+            'renewal_options': 2,
+            'option_term': 5,
+            'escalation_type': 'Fixed Bumps Every N Years',
+            'bump_frequency': 5,
+            'bump_percentage': 10.0,
+            'annual_escalator': 0.0,
+            'status': 'Occupied',
+            'rerent_enabled': False,
+            'rerent_market_rent': 100000,
+            'rerent_vacancy_months': 6,
+            'rerent_ti_cost': 0,
+            'rerent_lc_pct': 6.0
+        })
+        st.rerun()
 
-    st.markdown("**Current Rent & Escalation**")
-    base_annual_rent = st.number_input("Current Base Rent ($)", value=250000, step=10000, key="base_annual_rent")
-    rent_structure_type = st.selectbox("Escalation Type", options=[
-        "Fixed Bumps Every N Years",
-        "Annual Escalator (%)",
-        "Flat (No Increases)"
-    ], index=0, key="rent_structure_type")
+    if col2.button("➖ Remove Last", use_container_width=True, disabled=len(st.session_state['tenants']) <= 1):
+        st.session_state['tenants'].pop()
+        st.rerun()
 
-    if rent_structure_type == "Fixed Bumps Every N Years":
-        bump_frequency = st.number_input("Bump Every (years)", value=5, min_value=1, max_value=10, step=1, key="bump_frequency")
-        bump_percentage = st.number_input("Bump Amount (%)", value=10.0, min_value=0.0, step=0.5, key="bump_percentage")
-        annual_escalator = 0.0
-    elif rent_structure_type == "Annual Escalator (%)":
-        annual_escalator = st.number_input("Annual Increase (%)", value=1.5, min_value=0.0, step=0.1, key="annual_escalator")
-        bump_frequency = 0
-        bump_percentage = 0.0
-    else:  # Flat
-        bump_frequency = 0
-        bump_percentage = 0.0
-        annual_escalator = 0.0
+    st.markdown("---")
 
-# Renegotiated lease (separate expander for clarity)
-with st.sidebar.expander("🔄 Lease Renegotiation"):
-    renegotiate_lease = st.checkbox("Model a Lease Renegotiation", value=False, key="renegotiate_lease")
+    # Display each tenant's inputs
+    for i, tenant in enumerate(st.session_state['tenants']):
+        with st.expander(f"📋 {tenant['name']}", expanded=(i == 0)):
+            tenant['name'] = st.text_input("Tenant Name", value=tenant['name'], key=f"tenant_name_{tenant['id']}")
+            tenant['status'] = st.selectbox("Status", options=['Occupied', 'Vacant'], index=0 if tenant['status'] == 'Occupied' else 1, key=f"tenant_status_{tenant['id']}")
 
-    if renegotiate_lease:
-        renego_year = st.number_input("Renegotiation Happens in Year", value=3, min_value=1, max_value=20, step=1, key="renego_year")
-        st.caption("New terms apply from this year onward")
+            if tenant['status'] == 'Occupied':
+                tenant['sqft'] = st.number_input("Square Footage", value=int(tenant['sqft']), step=100, min_value=0, key=f"tenant_sqft_{tenant['id']}")
+                tenant['annual_rent'] = st.number_input("Annual Rent ($)", value=int(tenant['annual_rent']), step=10000, min_value=0, key=f"tenant_rent_{tenant['id']}")
 
-        # Multi-tenant mode toggle
-        multi_tenant_mode = st.checkbox("Split Property into Multiple Tenants", value=st.session_state.multi_tenant_mode, key="multi_tenant_mode")
-        st.session_state.multi_tenant_mode = multi_tenant_mode
+                st.markdown("**Lease Terms**")
+                tenant['lease_expiration_year'] = st.number_input("Years Until Lease Expires", value=float(tenant['lease_expiration_year']), min_value=0.0, max_value=30.0, step=0.5, key=f"tenant_exp_{tenant['id']}")
+                tenant['years_elapsed'] = st.number_input("Years Into Current Lease", value=tenant['years_elapsed'], min_value=0, max_value=30, step=1, key=f"tenant_elapsed_{tenant['id']}")
+                tenant['renewal_options'] = st.number_input("Renewal Options", value=tenant['renewal_options'], min_value=0, max_value=5, step=1, key=f"tenant_renewals_{tenant['id']}")
+                tenant['option_term'] = st.number_input("Option Term (years)", value=tenant['option_term'], min_value=1, max_value=10, step=1, key=f"tenant_opt_term_{tenant['id']}")
 
-        if not multi_tenant_mode:
-            # Single tenant renegotiation (existing logic)
-            renego_rent = st.number_input("New Base Rent ($)", value=base_annual_rent, step=10000, key="renego_rent")
+                st.markdown("**Re-Leasing (After Options Expire)**")
+                tenant['rerent_enabled'] = st.checkbox("Re-rent at market after expiration", value=tenant.get('rerent_enabled', False), key=f"tenant_rerent_{tenant['id']}")
+                if tenant['rerent_enabled']:
+                    tenant['rerent_market_rent'] = st.number_input("Market Rent ($/yr)", value=int(tenant.get('rerent_market_rent', tenant['annual_rent'])), step=5000, min_value=0, key=f"tenant_mkt_rent_{tenant['id']}")
+                    tenant['rerent_vacancy_months'] = st.number_input("Vacancy Period (months)", value=int(tenant.get('rerent_vacancy_months', 6)), min_value=0, max_value=24, step=1, key=f"tenant_vac_mo_{tenant['id']}")
+                    tenant['rerent_ti_cost'] = st.number_input("TI Cost ($)", value=int(tenant.get('rerent_ti_cost', 0)), step=5000, min_value=0, key=f"tenant_ti_{tenant['id']}",
+                                                               help="Tenant improvement allowance for new lease")
+                    tenant['rerent_lc_pct'] = st.number_input("Leasing Commission (% of new lease yr 1)", value=float(tenant.get('rerent_lc_pct', 6.0)), step=0.5, min_value=0.0, key=f"tenant_lc_{tenant['id']}")
+                else:
+                    tenant['rerent_market_rent'] = tenant.get('rerent_market_rent', tenant['annual_rent'])
+                    tenant['rerent_vacancy_months'] = tenant.get('rerent_vacancy_months', 6)
+                    tenant['rerent_ti_cost'] = tenant.get('rerent_ti_cost', 0)
+                    tenant['rerent_lc_pct'] = tenant.get('rerent_lc_pct', 6.0)
 
-            renego_structure = st.selectbox("New Escalation Type", options=[
-                "Fixed Bumps Every N Years",
-                "Annual Escalator (%)",
-                "Flat (No Increases)"
-            ], index=0, key="renego_structure")
-
-            if renego_structure == "Fixed Bumps Every N Years":
-                renego_bump_freq = st.number_input("New Bump Every (years)", value=5, min_value=1, max_value=10, step=1, key="renego_bump_freq")
-                renego_bump_pct = st.number_input("New Bump Amount (%)", value=10.0, min_value=0.0, step=0.5, key="renego_bump_pct")
-                renego_escalator = 0.0
-            elif renego_structure == "Annual Escalator (%)":
-                renego_escalator = st.number_input("New Annual Increase (%)", value=2.0, min_value=0.0, step=0.1, key="renego_escalator")
-                renego_bump_freq = 0
-                renego_bump_pct = 0.0
-            else:
-                renego_bump_freq = 0
-                renego_bump_pct = 0.0
-                renego_escalator = 0.0
-
-            renego_new_term = st.number_input("New Term Length (years from renegotiation)", value=10, min_value=1, max_value=30, step=1, key="renego_new_term")
-
-        else:
-            # Multi-tenant mode
-            st.markdown("---")
-            st.markdown("**🏢 Tenant Management**")
-
-            # Display current tenants and add/remove buttons
-            st.caption(f"Total tenants: {1 + len(st.session_state.tenants)}")
-
-            # Tenant 1 (original tenant - now reduced space)
-            with st.expander("📍 Tenant 1 (Original Tenant)", expanded=True):
-                t1_pct = st.number_input("% of Building", value=60.0, min_value=0.0, max_value=100.0, step=5.0, key="t1_pct")
-                t1_rent = st.number_input("Annual Rent ($)", value=int(base_annual_rent * 0.6), step=5000, key="t1_rent")
-
-                t1_structure = st.selectbox("Escalation Type", options=[
+                st.markdown("**Rent Escalation**")
+                tenant['escalation_type'] = st.selectbox("Escalation Type", options=[
                     "Fixed Bumps Every N Years",
                     "Annual Escalator (%)",
                     "Flat (No Increases)"
-                ], index=0, key="t1_structure")
+                ], index=['Fixed Bumps Every N Years', 'Annual Escalator (%)', 'Flat (No Increases)'].index(tenant['escalation_type']), key=f"tenant_esc_type_{tenant['id']}")
 
-                if t1_structure == "Fixed Bumps Every N Years":
-                    t1_bump_freq = st.number_input("Bump Every (years)", value=5, min_value=1, max_value=10, step=1, key="t1_bump_freq")
-                    t1_bump_pct = st.number_input("Bump Amount (%)", value=10.0, min_value=0.0, step=0.5, key="t1_bump_pct")
-                    t1_escalator = 0.0
-                elif t1_structure == "Annual Escalator (%)":
-                    t1_escalator = st.number_input("Annual Increase (%)", value=2.0, min_value=0.0, step=0.1, key="t1_escalator")
-                    t1_bump_freq = 0
-                    t1_bump_pct = 0.0
+                if tenant['escalation_type'] == "Fixed Bumps Every N Years":
+                    tenant['bump_frequency'] = st.number_input("Bump Every (years)", value=tenant['bump_frequency'], min_value=1, max_value=10, step=1, key=f"tenant_bump_freq_{tenant['id']}")
+                    tenant['bump_percentage'] = st.number_input("Bump Amount (%)", value=tenant['bump_percentage'], min_value=0.0, step=0.5, key=f"tenant_bump_pct_{tenant['id']}")
+                    tenant['annual_escalator'] = 0.0
+                elif tenant['escalation_type'] == "Annual Escalator (%)":
+                    tenant['annual_escalator'] = st.number_input("Annual Increase (%)", value=tenant.get('annual_escalator', 1.5), min_value=0.0, step=0.1, key=f"tenant_ann_esc_{tenant['id']}")
+                    tenant['bump_frequency'] = 0
+                    tenant['bump_percentage'] = 0.0
                 else:
-                    t1_bump_freq = 0
-                    t1_bump_pct = 0.0
-                    t1_escalator = 0.0
-
-                t1_term = st.number_input("Lease Term (years from renego)", value=10, min_value=1, max_value=30, step=1, key="t1_term")
-
-            # Additional tenants
-            for idx, tenant in enumerate(st.session_state.tenants):
-                tid = tenant['id']
-                with st.expander(f"📍 Tenant {tid}", expanded=False):
-                    tenant['pct'] = st.number_input(f"% of Building", value=tenant.get('pct', 20.0), min_value=0.0, max_value=100.0, step=5.0, key=f"t{tid}_pct")
-                    tenant['rent'] = st.number_input(f"Annual Rent ($)", value=tenant.get('rent', 50000), step=5000, key=f"t{tid}_rent")
-                    tenant['occupancy_year'] = st.number_input(f"Occupies in Year", value=tenant.get('occupancy_year', renego_year + 1), min_value=renego_year, max_value=holding_period, step=1, key=f"t{tid}_occ")
-                    tenant['ti_cost'] = st.number_input(f"TI Cost ($)", value=tenant.get('ti_cost', 0), step=10000, key=f"t{tid}_ti")
-                    tenant['commission_pct'] = st.number_input(f"Leasing Commission (%)", value=tenant.get('commission_pct', 5.0), min_value=0.0, step=0.5, key=f"t{tid}_comm")
-
-                    tenant['structure'] = st.selectbox(f"Escalation Type", options=[
-                        "Fixed Bumps Every N Years",
-                        "Annual Escalator (%)",
-                        "Flat (No Increases)"
-                    ], index=0, key=f"t{tid}_structure")
-
-                    if tenant['structure'] == "Fixed Bumps Every N Years":
-                        tenant['bump_freq'] = st.number_input(f"Bump Every (years)", value=tenant.get('bump_freq', 5), min_value=1, max_value=10, step=1, key=f"t{tid}_bump_freq")
-                        tenant['bump_pct'] = st.number_input(f"Bump Amount (%)", value=tenant.get('bump_pct', 10.0), min_value=0.0, step=0.5, key=f"t{tid}_bump_pct")
-                        tenant['escalator'] = 0.0
-                    elif tenant['structure'] == "Annual Escalator (%)":
-                        tenant['escalator'] = st.number_input(f"Annual Increase (%)", value=tenant.get('escalator', 2.0), min_value=0.0, step=0.1, key=f"t{tid}_escalator")
-                        tenant['bump_freq'] = 0
-                        tenant['bump_pct'] = 0.0
-                    else:
-                        tenant['bump_freq'] = 0
-                        tenant['bump_pct'] = 0.0
-                        tenant['escalator'] = 0.0
-
-                    tenant['term'] = st.number_input(f"Lease Term (years from occupancy)", value=tenant.get('term', 10), min_value=1, max_value=30, step=1, key=f"t{tid}_term")
-
-                    if st.button(f"Remove Tenant {tid}", key=f"remove_t{tid}"):
-                        st.session_state.tenants = [t for t in st.session_state.tenants if t['id'] != tid]
-                        st.rerun()
-
-            # Add tenant button
-            if st.button("➕ Add New Tenant", key="add_tenant"):
-                st.session_state.tenants.append({
-                    'id': st.session_state.next_tenant_id,
-                    'pct': 20.0,
-                    'rent': 50000,
-                    'occupancy_year': renego_year + 1,
-                    'ti_cost': 0,
-                    'commission_pct': 5.0,
-                    'structure': 'Flat (No Increases)',
-                    'bump_freq': 0,
-                    'bump_pct': 0.0,
-                    'escalator': 0.0,
-                    'term': 10
-                })
-                st.session_state.next_tenant_id += 1
-                st.rerun()
-
-            # Show total occupancy
-            total_pct = t1_pct + sum(t.get('pct', 0) for t in st.session_state.tenants)
-            if total_pct > 100:
-                st.error(f"⚠️ Total occupancy {total_pct:.0f}% exceeds 100%")
+                    tenant['bump_frequency'] = 0
+                    tenant['bump_percentage'] = 0.0
+                    tenant['annual_escalator'] = 0.0
             else:
-                st.info(f"Total occupied: {total_pct:.0f}% | Vacant: {100-total_pct:.0f}%")
+                # Vacant tenant
+                tenant['sqft'] = st.number_input("Square Footage", value=tenant['sqft'], step=100, min_value=0, key=f"tenant_sqft_{tenant['id']}")
+                tenant['annual_rent'] = 0
+                tenant['lease_expiration_year'] = 0
+                tenant['years_elapsed'] = 0
+                tenant['renewal_options'] = 0
+                tenant['option_term'] = 0
+                tenant['bump_frequency'] = 0
+                tenant['bump_percentage'] = 0.0
+                tenant['annual_escalator'] = 0.0
 
-            # Set dummy values for single-tenant variables (won't be used)
-            renego_rent = t1_rent
-            renego_structure = t1_structure
-            renego_bump_freq = t1_bump_freq
-            renego_bump_pct = t1_bump_pct
-            renego_escalator = t1_escalator
-            renego_new_term = t1_term
+# Store aggregated values for backward compatibility with existing calculations
+# (We'll update the NOI calculation to use the tenant list directly)
+base_annual_rent = sum([t['annual_rent'] for t in st.session_state['tenants']])
+property_sqft = sum([t['sqft'] for t in st.session_state['tenants']])
+# For single-tenant compatibility, use first tenant's lease terms
+if st.session_state['tenants']:
+    first_tenant = st.session_state['tenants'][0]
+    current_term_remaining_input = first_tenant['lease_expiration_year']
+    years_elapsed = first_tenant['years_elapsed']
+    num_renewal_options = first_tenant['renewal_options']
+    option_term_years = first_tenant['option_term']
+    rent_structure_type = first_tenant['escalation_type']
+    bump_frequency = first_tenant['bump_frequency']
+    bump_percentage = first_tenant['bump_percentage']
+    annual_escalator = first_tenant['annual_escalator']
+else:
+    current_term_remaining_input = 0
+    years_elapsed = 0
+    num_renewal_options = 0
+    option_term_years = 5
+    rent_structure_type = "Flat (No Increases)"
+    bump_frequency = 0
+    bump_percentage = 0.0
+    annual_escalator = 0.0
 
-    else:
-        renego_year = 999
-        renego_rent = base_annual_rent
-        renego_structure = rent_structure_type
-        renego_bump_freq = bump_frequency
-        renego_bump_pct = bump_percentage
-        renego_escalator = annual_escalator
-        renego_new_term = 0
-        st.session_state.multi_tenant_mode = False
+# Remove lease renegotiation for now in multi-tenant (can add per-tenant renegotiation later)
+renegotiate_lease = False
+renego_year = 999
+renego_rent = base_annual_rent
+renego_structure = rent_structure_type
+renego_bump_freq = bump_frequency
+renego_bump_pct = bump_percentage
+renego_escalator = annual_escalator
+renego_new_term = 0
 
 # Section 2: Acquisition Costs
 with st.sidebar.expander("💰 Acquisition Costs"):
@@ -361,29 +361,29 @@ with st.sidebar.expander("💰 Acquisition Costs"):
         perm_orig_points_acq = st.number_input("Perm Loan Origination (points)", value=1.5, step=0.1, key="perm_orig_points_acq")
     acquisition_fee_pct = st.number_input("Acquisition Fee to GP (% of purchase)", value=1.5, step=0.1, key="acquisition_fee_pct")
 
+# Section 2b: Capital Expenditures
+with st.sidebar.expander("🔧 Capital Expenditures"):
+    value_add_capex = st.number_input("CapEx Amount ($)", value=0, step=25000, key="value_add_capex")
+    value_add_year = st.number_input("Spend in Year", value=1, min_value=1, max_value=10, step=1, key="value_add_year")
+    st.caption("Added to equity raise at close; spent in the selected year")
+
 # Section 3: Bridge Financing (only for value-add strategy)
 if deal_strategy == "Bridge-to-Permanent (Value-Add)":
     with st.sidebar.expander("🏦 Bridge Financing"):
         bridge_ltv = st.number_input("Bridge Loan LTV (%)", value=75.0, step=1.0, max_value=100.0, key="bridge_ltv")
         bridge_rate = st.number_input("Bridge Interest Rate (%)", value=7.0, step=0.1, key="bridge_rate")
-        bridge_term = st.number_input("Bridge Term (years)", value=2, step=1, max_value=5, key="bridge_term")
+        bridge_term = st.number_input("Bridge Term (years)", value=2, step=1, min_value=1, max_value=5, key="bridge_term")
         bridge_io = st.checkbox("Interest Only?", value=True, key="bridge_io")
         bridge_prepay_penalty = st.number_input("Prepayment Penalty (%)", value=2.0, step=0.1, key="bridge_prepay_penalty")
-
-        st.markdown("**Value-Add Capital**")
-        value_add_capex = st.number_input("Value-Add CapEx ($)", value=0, step=25000, key="value_add_capex")
-        value_add_year  = st.number_input("Spend in Year", value=1, min_value=1, max_value=5, step=1, key="value_add_year")
-        st.caption("Added to equity raise at close; spent in the selected year")
 else:
     # Default values for buy-and-hold (won't use bridge loan)
-    bridge_ltv = 0
-    bridge_rate = 0
-    bridge_term = 0
-    bridge_io = True
-    bridge_prepay_penalty = 0
-    bridge_orig_points = 0
-    value_add_capex = 0
-    value_add_year  = 1
+    # Read from session_state to preserve values if user switches between strategies
+    bridge_ltv = st.session_state.get('bridge_ltv', 0)
+    bridge_rate = st.session_state.get('bridge_rate', 0)
+    bridge_term = st.session_state.get('bridge_term', 0)
+    bridge_io = st.session_state.get('bridge_io', True)
+    bridge_prepay_penalty = st.session_state.get('bridge_prepay_penalty', 0)
+    bridge_orig_points = st.session_state.get('bridge_orig_points', 0)
 
 # Section 4: Permanent Financing
 with st.sidebar.expander("🏛️ Permanent Financing"):
@@ -412,18 +412,18 @@ with st.sidebar.expander("🏛️ Permanent Financing"):
         if refi_valuation_method == "Based on Cap Rate":
             refi_cap_rate = st.number_input("Refinance Cap Rate (%)", value=6.5, step=0.1, key="refi_cap_rate")
             st.caption("Lender will value property at NOI / Cap Rate")
-            fixed_refi_value = 0
-            appreciation_rate = 0
+            fixed_refi_value = st.session_state.get('fixed_refi_value', 0)
+            appreciation_rate = st.session_state.get('appreciation_rate', 0)
         elif refi_valuation_method == "Fixed Property Value":
             fixed_refi_value = st.number_input("Property Value at Refi ($)", value=5500000, step=100000, key="fixed_refi_value")
             st.caption("Enter appraised value")
-            refi_cap_rate = 0
-            appreciation_rate = 0
+            refi_cap_rate = st.session_state.get('refi_cap_rate', 0)
+            appreciation_rate = st.session_state.get('appreciation_rate', 0)
         else:  # Based on Original Purchase Price
             appreciation_rate = st.number_input("Appreciation Rate (% per year)", value=3.0, step=0.5, key="appreciation_rate")
             st.caption("Calculates: Value = Purchase Price × (1 + rate)^years")
-            refi_cap_rate = 0
-            fixed_refi_value = 0
+            refi_cap_rate = st.session_state.get('refi_cap_rate', 0)
+            fixed_refi_value = st.session_state.get('fixed_refi_value', 0)
 
         st.markdown("**Permanent Loan Constraints**")
         perm_ltv = st.number_input("Permanent LTV Target (%)", value=75.0, step=1.0, max_value=100.0, key="perm_ltv")
@@ -436,8 +436,11 @@ with st.sidebar.expander("🏛️ Permanent Financing"):
         if allow_cashout:
             max_cashout_pct = st.number_input("Maximum Cash-Out (% of equity gained)", value=80.0, step=5.0, max_value=100.0, key="max_cashout_pct")
             st.caption("Lenders typically limit cash-out to 80% of equity gained")
+            refi_prorata = st.checkbox("Distribute refi proceeds pro-rata (bypass waterfall)", value=True, key="refi_prorata",
+                                       help="Pro-rata: distributed by equity %. Through waterfall: subject to pref/promote.")
         else:
-            max_cashout_pct = 0
+            max_cashout_pct = st.session_state.get('max_cashout_pct', 0)
+            refi_prorata = True
             st.caption("Refi will be used only to pay off bridge loan")
     else:
         # Buy-and-hold: permanent loan at acquisition
@@ -475,24 +478,30 @@ with st.sidebar.expander("🏛️ Permanent Financing"):
             allow_cashout = st.checkbox("Allow Cash-Out?", value=True, key="allow_cashout")
             if allow_cashout:
                 max_cashout_pct = st.number_input("Max Cash-Out (% of equity gained)", value=80.0, step=5.0, max_value=100.0, key="max_cashout_pct")
+                refi_prorata = st.checkbox("Distribute refi proceeds pro-rata (bypass waterfall)", value=True, key="refi_prorata",
+                                           help="Pro-rata: distributed by equity %. Through waterfall: subject to pref/promote.")
             else:
-                max_cashout_pct = 0
+                max_cashout_pct = st.session_state.get('max_cashout_pct', 0)
+                refi_prorata = True
         else:
-            # No refi planned
+            # No refi planned - read from session_state to preserve values
             refi_year = 999  # Never
-            perm_orig_points = 0
-            refi_legal_costs = 0
-            refi_valuation_method = "Based on Cap Rate"
-            refi_cap_rate = 6.5
-            fixed_refi_value = 0
-            appreciation_rate = 0
-            allow_cashout = False
-            max_cashout_pct = 0
+            perm_orig_points = st.session_state.get('perm_orig_points', 0)
+            refi_legal_costs = st.session_state.get('refi_legal_costs', 0)
+            refi_valuation_method = st.session_state.get('refi_valuation_method', "Based on Cap Rate")
+            refi_cap_rate = st.session_state.get('refi_cap_rate', 6.5)
+            fixed_refi_value = st.session_state.get('fixed_refi_value', 0)
+            appreciation_rate = st.session_state.get('appreciation_rate', 0)
+            allow_cashout = st.session_state.get('allow_cashout', False)
+            max_cashout_pct = st.session_state.get('max_cashout_pct', 0)
+            refi_prorata = True
 
-# Section 5: Annual Operating
-with st.sidebar.expander("⚙️ Annual Operating"):
+# Section 5: Non-Operating Expenses
+with st.sidebar.expander("⚙️ Non-Operating Expenses"):
+    vacancy_credit_loss_pct = st.number_input("Vacancy & Credit Loss (%)", value=0.0, min_value=0.0, max_value=50.0, step=0.5, key="vacancy_credit_loss_pct",
+                                               help="Applied to gross rent. 0% for NNN single-tenant, 5-10% typical for multi-tenant.")
     capex_reserve = st.number_input("Annual CapEx Reserve ($)", value=10000, step=1000, key="capex_reserve")
-    prop_mgmt_pct = st.number_input("Asset Management Fee (% of NOI)", value=1.0, step=0.25, key="prop_mgmt_pct")
+    asset_mgmt_pct = st.number_input("Asset Management Fee (% of LP equity)", value=1.5, step=0.1, key="asset_mgmt_pct")
     admin_costs = st.number_input("Annual Admin/Accounting ($)", value=5000, step=500, key="admin_costs")
 
 # Section 6: Investor Structure
@@ -502,6 +511,8 @@ with st.sidebar.expander("👥 Investor Structure"):
     st.caption(f"GP Equity: {gp_equity_pct:.1f}%")
 
     pref_rate = st.number_input("Preferred Return Rate (%)", value=8.0, step=0.1, key="pref_rate")
+    pref_on_unreturned = st.checkbox("Pref on unreturned capital", value=False, key="pref_on_unreturned",
+                                     help="If checked, pref base reduces after capital return events (refi cash-out).")
     gp_profit_share = st.number_input("GP Base Split after Pref (%)", value=20.0, step=1.0, key="gp_profit_share")
     include_catchup = st.checkbox("Include GP Catch-up?", value=False, key="include_catchup")
 
@@ -532,6 +543,8 @@ with st.sidebar.expander("👥 Investor Structure"):
 # Section 7: Exit Assumptions
 with st.sidebar.expander("🚪 Exit Assumptions"):
     exit_cap_rate = st.number_input("Exit Cap Rate (%)", value=6.5, step=0.1, key="exit_cap_rate")
+    use_forward_noi = st.checkbox("Price on Forward NOI (Year N+1)", value=True, key="use_forward_noi",
+                                  help="Buyers typically value based on next year's projected NOI, not in-place.")
     broker_commission_pct = st.number_input("Broker Commission (%)", value=2.5, step=0.1, key="broker_commission_pct")
     exit_legal_pct = st.number_input("Exit Legal/Closing (%)", value=0.75, step=0.05, key="exit_legal_pct")
     disposition_fee_pct = st.number_input("Disposition Fee to GP (%)", value=1.0, step=0.1, key="disposition_fee_pct")
@@ -547,12 +560,13 @@ export_lender = st.sidebar.checkbox("Lender Presentation", value=False)
 # PDF download buttons are rendered at the bottom of the script (after all tabs compute)
 
 # MAIN AREA - Create tabs
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "💵 Cash Flow Projections",
     "💧 Waterfall Distributions",
     "📊 Return Metrics",
     "🔍 Sensitivity Analysis",
-    "📈 Debt Analysis"
+    "📈 Debt Analysis",
+    "🏛️ Tax & Depreciation"
 ])
 
 with tab1:
@@ -592,91 +606,8 @@ with tab1:
 
     st.markdown("---")
 
-    # Calculate NOI projection
-    if renegotiate_lease and renego_year <= holding_period and st.session_state.multi_tenant_mode:
-        # MULTI-TENANT MODE
-        # Pre-renego: single tenant
-        noi_df_pre = calculate_noi_projection_with_lease(
-            base_annual_rent, rent_structure_type, bump_frequency,
-            bump_percentage, annual_escalator, renego_year - 1,
-            runway['current_term_remaining'], runway['max_total_runway'], years_elapsed
-        )
-
-        # Post-renego: multiple tenants
-        # Build NOI for each tenant then sum
-        years_post_renego = holding_period - (renego_year - 1)
-        noi_data_post = []
-
-        for year in range(1, years_post_renego + 1):
-            actual_year = year + (renego_year - 1)
-            total_rent = 0
-            occupied_pct = 0
-
-            # Tenant 1 (original, always occupied from renego year)
-            t1_noi_df = calculate_noi_projection_with_lease(
-                t1_rent, t1_structure, t1_bump_freq, t1_bump_pct, t1_escalator,
-                years_post_renego, t1_term, t1_term, 0
-            )
-            t1_rent_this_year = t1_noi_df[t1_noi_df['Year'] == year]['NOI'].values[0]
-            total_rent += t1_rent_this_year
-            occupied_pct += t1_pct
-
-            # Additional tenants
-            for tenant in st.session_state.tenants:
-                if actual_year >= tenant['occupancy_year']:
-                    # Tenant is occupied
-                    years_since_occ = actual_year - tenant['occupancy_year'] + 1
-                    t_noi_df = calculate_noi_projection_with_lease(
-                        tenant['rent'], tenant['structure'], tenant['bump_freq'],
-                        tenant['bump_pct'], tenant['escalator'], years_since_occ,
-                        tenant['term'], tenant['term'], 0
-                    )
-                    t_rent = t_noi_df[t_noi_df['Year'] == years_since_occ]['NOI'].values[0]
-                    total_rent += t_rent
-                    occupied_pct += tenant['pct']
-
-            # Landlord pays opex for vacant space
-            vacant_pct = 100 - occupied_pct
-            landlord_opex = (capex_reserve + admin_costs) * (vacant_pct / 100)
-
-            noi_data_post.append({
-                'Year': actual_year,
-                'NOI': total_rent - landlord_opex,
-                'Lease Status': f"Multi-tenant ({occupied_pct:.0f}% occupied)"
-            })
-
-        noi_df_post = pd.DataFrame(noi_data_post)
-        noi_df = pd.concat([noi_df_pre, noi_df_post], ignore_index=True)
-
-    elif renegotiate_lease and renego_year <= holding_period:
-        # SINGLE TENANT RENEGOTIATION
-        # Segment 1: current lease terms up to renegotiation year
-        noi_df_pre = calculate_noi_projection_with_lease(
-            base_annual_rent, rent_structure_type, bump_frequency,
-            bump_percentage, annual_escalator, renego_year - 1,
-            runway['current_term_remaining'], runway['max_total_runway'], years_elapsed
-        )
-
-        # Segment 2: new lease terms from renegotiation onward
-        years_post_renego = holding_period - (renego_year - 1)
-        noi_df_post = calculate_noi_projection_with_lease(
-            renego_rent, renego_structure, renego_bump_freq,
-            renego_bump_pct, renego_escalator, years_post_renego,
-            renego_new_term, renego_new_term, 0
-        )
-        noi_df_post['Year'] = noi_df_post['Year'] + (renego_year - 1)
-        noi_df_post['Lease Status'] = noi_df_post['Lease Status'].apply(
-            lambda s: f"Renegotiated ({s})"
-        )
-
-        noi_df = pd.concat([noi_df_pre, noi_df_post], ignore_index=True)
-    else:
-        # NO RENEGOTIATION
-        noi_df = calculate_noi_projection_with_lease(
-            base_annual_rent, rent_structure_type, bump_frequency,
-            bump_percentage, annual_escalator, holding_period,
-            runway['current_term_remaining'], runway['max_total_runway'], years_elapsed
-        )
+    # Calculate NOI projection using multi-tenant model
+    noi_df = calculate_multi_tenant_noi(st.session_state['tenants'], holding_period)
 
     # Initialize variables
     refi_results = None
@@ -722,33 +653,18 @@ with tab1:
     # Calculate LP and GP equity amounts based on percentages
     from calculations.cash_flows import calculate_total_project_cost
 
-    # Calculate total TI and commission costs for multi-tenant mode
-    total_ti_comm = 0
-    if st.session_state.multi_tenant_mode and renegotiate_lease:
-        for tenant in st.session_state.tenants:
-            total_ti_comm += tenant['ti_cost']
-            # Commission based on first year rent
-            t_noi_df_comm = calculate_noi_projection_with_lease(
-                tenant['rent'], tenant['structure'], tenant['bump_freq'],
-                tenant['bump_pct'], tenant['escalator'], 1,
-                tenant['term'], tenant['term'], 0
-            )
-            first_year_rent = t_noi_df_comm[t_noi_df_comm['Year'] == 1]['NOI'].values[0]
-            commission = first_year_rent * (tenant['commission_pct'] / 100)
-            total_ti_comm += commission
-
     if deal_strategy == "Bridge-to-Permanent (Value-Add)":
         costs_for_equity = calculate_total_project_cost(
             purchase_price, closing_costs_pct, bridge_orig_points,
             acquisition_fee_pct, bridge_loan_amount
         )
-        total_equity_needed = costs_for_equity['total_uses'] - bridge_loan_amount + value_add_capex + total_ti_comm
+        total_equity_needed = costs_for_equity['total_uses'] - bridge_loan_amount + value_add_capex
     else:
         costs_for_equity = calculate_total_project_cost(
             purchase_price, closing_costs_pct, perm_orig_points_acq,
             acquisition_fee_pct, initial_loan_amount
         )
-        total_equity_needed = costs_for_equity['total_uses'] - initial_loan_amount + total_ti_comm
+        total_equity_needed = costs_for_equity['total_uses'] - initial_loan_amount
 
     # Split equity by percentages
     lp_equity = total_equity_needed * (lp_equity_pct / 100)
@@ -757,8 +673,12 @@ with tab1:
     # Create cash flow table
     cf_data = []
     for year in range(1, holding_period + 1):
-        noi = noi_df[noi_df['Year'] == year]['NOI'].values[0]
-        lease_status = noi_df[noi_df['Year'] == year]['Lease Status'].values[0]
+        year_row = noi_df[noi_df['Year'] == year].iloc[0]
+        gross_rent = year_row['NOI']
+        vcl_deduction = gross_rent * (vacancy_credit_loss_pct / 100)
+        noi = gross_rent - vcl_deduction
+        ti_lc_cost = year_row.get('TI_LC_Cost', 0)
+        lease_status = year_row['Lease Status']
 
         # Determine which loan is active based on strategy
         if deal_strategy == "Bridge-to-Permanent (Value-Add)":
@@ -799,6 +719,7 @@ with tab1:
 
                 # Refi happens at beginning of year - pay perm loan for full year
                 debt_service = perm_payment
+                # Ending balance after 1 year of payments
                 loan_balance = calculate_perm_loan_balance(
                     new_loan_amount, perm_rate, perm_amort, 1
                 )
@@ -806,11 +727,13 @@ with tab1:
                 loan_type = "Bridge→Perm"
 
             else:
-                # Permanent loan period
+                # Permanent loan period (years after refi)
                 debt_service = perm_payment
                 years_since_refi = year - refi_year
+                # Balance calculation: year - refi_year gives years AFTER refi year,
+                # but we need total years of payments (including refi year)
                 loan_balance = calculate_perm_loan_balance(
-                    new_loan_amount, perm_rate, perm_amort, years_since_refi
+                    new_loan_amount, perm_rate, perm_amort, years_since_refi + 1
                 )
                 loan_type = "Perm"
 
@@ -862,47 +785,36 @@ with tab1:
                 debt_service = perm_payment
                 years_since_refi = year - refi_year
                 loan_balance = calculate_perm_loan_balance(
-                    new_loan_amount, perm_rate, perm_amort, years_since_refi
+                    new_loan_amount, perm_rate, perm_amort, years_since_refi + 1
                 )
                 loan_type = "Perm"
 
         # Operating expenses
-        asset_mgmt_fee = noi * (prop_mgmt_pct / 100)
-        total_operating_expenses = capex_reserve + asset_mgmt_fee + admin_costs
+        asset_mgmt_fee = lp_equity * (asset_mgmt_pct / 100)
+        total_operating_expenses = capex_reserve + asset_mgmt_fee + admin_costs + ti_lc_cost
 
         # Cash flow before debt
         cash_before_debt = noi - total_operating_expenses
 
-        # Cash available for distribution (before refi proceeds)
+        # Cash available for distribution
         cash_before_refi = cash_before_debt - debt_service
 
-        # Add refi proceeds in refi year
-        if year == refi_year:
-            cash_available = cash_before_refi + refi_proceeds
-        else:
+        # Refi proceeds handling: pro-rata bypasses waterfall, otherwise flows through
+        refi_this_year = refi_proceeds if year == refi_year else 0
+        if refi_prorata:
+            # Pro-rata: refi proceeds distributed outside waterfall
             cash_available = cash_before_refi
+            refi_dist_lp = refi_this_year * (lp_equity_pct / 100) if (lp_equity_pct + gp_equity_pct) > 0 else 0
+            refi_dist_gp = refi_this_year * (gp_equity_pct / 100) if (lp_equity_pct + gp_equity_pct) > 0 else 0
+        else:
+            # Through waterfall: existing behavior
+            cash_available = cash_before_refi + refi_this_year
+            refi_dist_lp = 0
+            refi_dist_gp = 0
 
         # Value-add capex spend
         va_capex_this_year = value_add_capex if (year == value_add_year and value_add_capex > 0) else 0
         cash_available -= va_capex_this_year
-
-        # TI costs and leasing commissions (multi-tenant mode)
-        ti_comm_this_year = 0
-        if st.session_state.multi_tenant_mode and renegotiate_lease:
-            for tenant in st.session_state.tenants:
-                if year == tenant['occupancy_year']:
-                    ti_comm_this_year += tenant['ti_cost']
-                    # Commission based on first year rent
-                    t_noi_df_comm = calculate_noi_projection_with_lease(
-                        tenant['rent'], tenant['structure'], tenant['bump_freq'],
-                        tenant['bump_pct'], tenant['escalator'], 1,
-                        tenant['term'], tenant['term'], 0
-                    )
-                    first_year_rent = t_noi_df_comm[t_noi_df_comm['Year'] == 1]['NOI'].values[0]
-                    commission = first_year_rent * (tenant['commission_pct'] / 100)
-                    ti_comm_this_year += commission
-
-        cash_available -= ti_comm_this_year
 
         # DSCR
         dscr = calculate_dscr(noi, debt_service)
@@ -910,13 +822,18 @@ with tab1:
         cf_data.append({
             'Year': year,
             'Lease Status': lease_status,
+            'Gross Rent': gross_rent,
+            'V&C Loss': vcl_deduction,
             'NOI': noi,
-            'Operating Expenses': total_operating_expenses,
+            'TI/LC': ti_lc_cost,
+            'Non-Operating Expenses': total_operating_expenses,
             'Value-Add CapEx': va_capex_this_year,
-            'TI & Commissions': ti_comm_this_year,
             'Cash Before Debt': cash_before_debt,
             'Debt Service': debt_service,
             'Cash Available': cash_available,
+            'Refi Distribution': refi_this_year,
+            'Refi LP': refi_dist_lp,
+            'Refi GP': refi_dist_gp,
             'DSCR': dscr,
             'Loan Balance': loan_balance,
             'Loan Type': loan_type
@@ -924,13 +841,24 @@ with tab1:
 
     cf_df = pd.DataFrame(cf_data)
 
-    # Format and display
+    # Format and display — hide zero-only columns
+    display_cols = ['Year', 'Lease Status', 'Gross Rent']
+    if vcl_deduction > 0 or vacancy_credit_loss_pct > 0:
+        display_cols.append('V&C Loss')
+    display_cols += ['NOI']
+    if cf_df['TI/LC'].sum() > 0:
+        display_cols.append('TI/LC')
+    display_cols += ['Non-Operating Expenses', 'Value-Add CapEx', 'Cash Before Debt',
+                     'Debt Service', 'Cash Available', 'DSCR', 'Loan Balance', 'Loan Type']
+
     st.dataframe(
-        cf_df.style.format({
+        cf_df[display_cols].style.format({
+            'Gross Rent': '${:,.0f}',
+            'V&C Loss': '${:,.0f}',
             'NOI': '${:,.0f}',
-            'Operating Expenses': '${:,.0f}',
+            'TI/LC': '${:,.0f}',
+            'Non-Operating Expenses': '${:,.0f}',
             'Value-Add CapEx': '${:,.0f}',
-            'TI & Commissions': '${:,.0f}',
             'Cash Before Debt': '${:,.0f}',
             'Debt Service': '${:,.0f}',
             'Cash Available': '${:,.0f}',
@@ -939,6 +867,17 @@ with tab1:
         }),
         use_container_width=True
     )
+
+    # Cash flow chart
+    fig_cf = go.Figure()
+    fig_cf.add_trace(go.Bar(x=cf_df['Year'], y=cf_df['NOI'], name='NOI', marker_color='#2196F3'))
+    fig_cf.add_trace(go.Bar(x=cf_df['Year'], y=cf_df['Debt Service'], name='Debt Service', marker_color='#FF5722'))
+    fig_cf.add_trace(go.Scatter(x=cf_df['Year'], y=cf_df['Cash Available'], name='Cash Available',
+                                 mode='lines+markers', line=dict(color='#4CAF50', width=3)))
+    fig_cf.update_layout(title='NOI, Debt Service & Cash Available', barmode='group',
+                         xaxis_title='Year', yaxis_title='$', yaxis_tickformat='$,.0f',
+                         height=350, margin=dict(t=40, b=30))
+    st.plotly_chart(fig_cf, use_container_width=True)
 
     # Display refinance details if refi occurred
     if refi_results:
@@ -1094,11 +1033,16 @@ with tab1:
             {'Use': 'Purchase Price', 'Amount': sources_uses['uses']['purchase_price']},
             {'Use': 'Closing Costs', 'Amount': sources_uses['uses']['closing_costs']},
             {'Use': loan_orig_label, 'Amount': sources_uses['uses']['bridge_origination']},  # Reusing field name
-            {'Use': 'Acquisition Fee', 'Amount': sources_uses['uses']['acquisition_fee']},
+            {'Use': 'Acquisition Fee', 'Amount': sources_uses['uses']['acquisition_fee']}
         ]
+        # Add value-add capex if applicable
         if value_add_capex > 0:
             uses_rows.append({'Use': 'Value-Add CapEx', 'Amount': value_add_capex})
-        uses_rows.append({'Use': 'TOTAL USES', 'Amount': sources_uses['uses']['total_uses'] + value_add_capex})
+
+        # Add total
+        total_uses_amount = sources_uses['uses']['total_uses'] + value_add_capex
+        uses_rows.append({'Use': 'TOTAL USES', 'Amount': total_uses_amount})
+
         uses_data = pd.DataFrame(uses_rows)
         st.dataframe(
             uses_data.style.format({'Amount': '${:,.0f}'}),
@@ -1209,7 +1153,7 @@ with tab2:
 
     waterfall_df = calculate_multi_year_waterfall(
         cf_df, lp_equity, gp_equity, pref_rate,
-        gp_profit_share, include_catchup
+        gp_profit_share, include_catchup, pref_on_unreturned
     )
 
     # Display waterfall table
@@ -1230,6 +1174,16 @@ with tab2:
         }),
         use_container_width=True
     )
+
+    # Cumulative distributions chart
+    fig_wf = go.Figure()
+    fig_wf.add_trace(go.Scatter(x=waterfall_df['Year'], y=waterfall_df['LP Cumulative'], name='LP Cumulative',
+                                 mode='lines+markers', fill='tozeroy', line=dict(color='#2196F3')))
+    fig_wf.add_trace(go.Scatter(x=waterfall_df['Year'], y=waterfall_df['GP Cumulative'], name='GP Cumulative',
+                                 mode='lines+markers', fill='tozeroy', line=dict(color='#FF9800')))
+    fig_wf.update_layout(title='Cumulative Distributions', xaxis_title='Year', yaxis_title='$',
+                         yaxis_tickformat='$,.0f', height=350, margin=dict(t=40, b=30))
+    st.plotly_chart(fig_wf, use_container_width=True)
 
     # Summary metrics
     st.markdown("---")
@@ -1267,9 +1221,15 @@ with tab3:
     st.subheader("📊 Return Metrics")
 
     # --- Exit Sale Proceeds ---
-    # Determine exit year NOI
-    exit_year_noi = cf_df.iloc[-1]['NOI']
     exit_loan_balance = cf_df.iloc[-1]['Loan Balance']
+    in_place_noi = cf_df.iloc[-1]['NOI']
+
+    if use_forward_noi:
+        # Project one extra year to get Year N+1 NOI (what buyers underwrite)
+        fwd_df = calculate_multi_tenant_noi(st.session_state['tenants'], holding_period + 1)
+        exit_year_noi = fwd_df.iloc[-1]['NOI']
+    else:
+        exit_year_noi = in_place_noi
 
     # Sale price from exit cap rate
     sale_price = exit_year_noi / (exit_cap_rate / 100)
@@ -1321,23 +1281,6 @@ with tab3:
 
     # Tier 4: Residual split — IRR promote, LP cap, or plain split
 
-    def _calc_irr_local(cashflows):
-        """IRR via binary search — defined here so it's available before calc_irr below."""
-        arr = np.array(cashflows, dtype=float)
-        if np.sum(arr[1:]) <= 0:
-            return None
-        low, high = -0.5, 5.0
-        for _ in range(200):
-            mid = (low + high) / 2
-            val = sum(cf / (1 + mid)**t for t, cf in enumerate(arr))
-            if abs(val) < 0.01:
-                return mid
-            if val > 0:
-                low = mid
-            else:
-                high = mid
-        return mid
-
     # --- IRR-Based Promote ---
     actual_deal_irr = None
     promote_triggered = False
@@ -1356,7 +1299,7 @@ with tab3:
             if i == len(waterfall_df) - 1:
                 annual_deal += gross_equity_proceeds
             deal_cfs_p.append(annual_deal)
-        actual_deal_irr = _calc_irr_local(deal_cfs_p)
+        actual_deal_irr = calculate_irr(deal_cfs_p)
 
         if actual_deal_irr is not None and actual_deal_irr * 100 > promote_hurdle_irr:
             lp_exit_split = remaining_after_pref * ((100 - gp_promote_share) / 100)
@@ -1386,7 +1329,7 @@ with tab3:
                 if i == len(lp_annual_cfs) - 1:
                     cf += lp_exit_cash
                 cfs.append(cf)
-            return _calc_irr_local(cfs)
+            return calculate_irr(cfs)
 
         # Check LP IRR if LP gets ALL the residual (upper bound)
         lp_irr_all = _lp_irr_given_exit_share(remaining_after_pref)
@@ -1552,6 +1495,10 @@ with tab3:
         lp_annual = waterfall_df.iloc[i]['LP Total']
         gp_annual = waterfall_df.iloc[i]['GP Total']
 
+        # Add pro-rata refi distributions (bypassed waterfall)
+        lp_annual += cf_df.iloc[i]['Refi LP']
+        gp_annual += cf_df.iloc[i]['Refi GP']
+
         # Add exit proceeds in final year
         if i == len(waterfall_df) - 1:
             lp_annual += lp_exit_total
@@ -1560,38 +1507,8 @@ with tab3:
         lp_cashflows.append(lp_annual)
         gp_cashflows.append(gp_annual)
 
-    # IRR calculation using numpy
-    def calc_irr(cashflows):
-        """Calculate IRR using numpy polynomial root finding"""
-        if len(cashflows) < 2:
-            return None
-        # numpy.irr is deprecated, use numpy_financial or manual calc
-        # Manual Newton's method approach
-        cashflows_arr = np.array(cashflows, dtype=float)
-
-        # Quick check: if all cashflows after 0 are <= 0, no positive IRR
-        if np.sum(cashflows_arr[1:]) <= 0:
-            return None
-
-        # Try a range of rates
-        def npv(rate):
-            return sum(cf / (1 + rate)**t for t, cf in enumerate(cashflows_arr))
-
-        # Binary search / Newton between -50% and 500%
-        low, high = -0.5, 5.0
-        for _ in range(200):
-            mid = (low + high) / 2
-            val = npv(mid)
-            if abs(val) < 0.01:
-                return mid
-            if val > 0:
-                low = mid
-            else:
-                high = mid
-        return mid
-
-    lp_irr = calc_irr(lp_cashflows)
-    gp_irr = calc_irr(gp_cashflows)
+    lp_irr = calculate_irr(lp_cashflows)
+    gp_irr = calculate_irr(gp_cashflows)
 
     # Equity multiples
     lp_total_return = sum(lp_cashflows[1:])  # all inflows
@@ -1626,7 +1543,7 @@ with tab3:
         total_returned = lp_total_return + gp_total_return
         deal_em = total_returned / total_invested if total_invested > 0 else 0
         deal_cashflows = [-total_invested] + [lp_cashflows[i] + gp_cashflows[i] for i in range(1, len(lp_cashflows))]
-        deal_irr = calc_irr(deal_cashflows)
+        deal_irr = calculate_irr(deal_cashflows)
         st.metric("Deal IRR", f"{deal_irr*100:.2f}%" if deal_irr is not None else "N/A")
         st.metric("Deal Equity Multiple", f"{deal_em:.2f}x")
         st.metric("Total Equity Invested", f"${total_invested:,.0f}")
@@ -1663,35 +1580,18 @@ with tab4:
     st.subheader("🔍 Sensitivity Analysis")
 
     # Helper: recalculate deal IRR given a purchase price and exit cap rate
-    def quick_deal_irr(pp, exit_cap, base_rent_val, bump_freq, bump_pct_val, ann_esc,
-                       hold_period, current_term_rem, lease_runway_val, yrs_elapsed,
+    def quick_deal_irr(pp, exit_cap, tenants_list, hold_period,
                        strategy, bridge_ltv_val, bridge_rate_val, bridge_term_val, bridge_io_val,
                        perm_rate_val, perm_amort_val, perm_ltv_val, target_dscr_val,
                        use_cons, lp_eq_pct, gp_eq_pct, pref_rate_val, gp_ps,
                        incl_catchup, closing_pct, orig_points, acq_fee_pct,
-                       capex_res, prop_mgmt_p, admin_c,
+                       capex_res, asset_mgmt_p, admin_c,
                        refi_yr, refi_val_method, refi_cap, fixed_refi_val, apprec_rate,
                        allow_co, max_co_pct, bridge_prepay_pen, perm_orig_pts, refi_legal,
-                       broker_comm_pct, exit_legal_p, disp_fee_pct, rent_struct):
+                       broker_comm_pct, exit_legal_p, disp_fee_pct, use_fwd_noi=True):
         """Stripped-down IRR calc for sensitivity - returns (deal_irr, lp_irr)"""
         try:
-            if renegotiate_lease and renego_year <= hold_period:
-                noi_pre = calculate_noi_projection_with_lease(
-                    base_rent_val, rent_struct, bump_freq, bump_pct_val, ann_esc,
-                    renego_year - 1, current_term_rem, lease_runway_val, yrs_elapsed
-                )
-                noi_post = calculate_noi_projection_with_lease(
-                    renego_rent, renego_structure, renego_bump_freq,
-                    renego_bump_pct, renego_escalator, hold_period - (renego_year - 1),
-                    renego_new_term, renego_new_term, 0
-                )
-                noi_post['Year'] = noi_post['Year'] + (renego_year - 1)
-                noi_df_s = pd.concat([noi_pre, noi_post], ignore_index=True)
-            else:
-                noi_df_s = calculate_noi_projection_with_lease(
-                    base_rent_val, rent_struct, bump_freq, bump_pct_val, ann_esc,
-                    hold_period, current_term_rem, lease_runway_val, yrs_elapsed
-                )
+            noi_df_s = calculate_multi_tenant_noi(tenants_list, hold_period)
 
             # Loan setup
             if strategy == "Bridge-to-Permanent (Value-Add)":
@@ -1730,7 +1630,10 @@ with tab4:
             refi_res = None
 
             for year in range(1, hold_period + 1):
-                noi_v = noi_df_s[noi_df_s['Year'] == year]['NOI'].values[0]
+                yr_row = noi_df_s[noi_df_s['Year'] == year].iloc[0]
+                gross_v = yr_row['NOI']
+                noi_v = gross_v * (1 - vacancy_credit_loss_pct / 100)
+                ti_lc_v = yr_row.get('TI_LC_Cost', 0)
 
                 if strategy == "Bridge-to-Permanent (Value-Add)":
                     if year < refi_yr:
@@ -1750,7 +1653,7 @@ with tab4:
                         rp = refi_res['net_proceeds']
                     else:
                         ds = pm
-                        lb = calculate_perm_loan_balance(new_ln, perm_rate_val, perm_amort_val, year - refi_yr)
+                        lb = calculate_perm_loan_balance(new_ln, perm_rate_val, perm_amort_val, year - refi_yr + 1)
                 else:
                     if year < refi_yr or refi_yr == 999:
                         ds = init_ds
@@ -1769,24 +1672,37 @@ with tab4:
                         rp = refi_res['net_proceeds']
                     else:
                         ds = pm
-                        lb = calculate_perm_loan_balance(new_ln, perm_rate_val, perm_amort_val, year - refi_yr)
+                        lb = calculate_perm_loan_balance(new_ln, perm_rate_val, perm_amort_val, year - refi_yr + 1)
 
-                amf = noi_v * (prop_mgmt_p / 100)
-                opex = capex_res + amf + admin_c
+                amf = lp_eq * (asset_mgmt_p / 100)
+                opex = capex_res + amf + admin_c + ti_lc_v
                 cbd = noi_v - opex
                 cbr = cbd - ds
-                ca = cbr + (rp if year == refi_yr else 0)
+                refi_this = rp if year == refi_yr else 0
+                if refi_prorata:
+                    ca = cbr  # refi proceeds bypass waterfall
+                else:
+                    ca = cbr + refi_this
                 ca -= value_add_capex if (year == value_add_year and value_add_capex > 0) else 0
 
-                cf_list.append({'Year': year, 'NOI': noi_v, 'Cash Available': ca, 'Loan Balance': lb})
+                # Pro-rata refi distributions for pref_on_unreturned tracking
+                total_eq_s = lp_eq + gp_eq
+                refi_lp_s = refi_this * (lp_eq / total_eq_s) if total_eq_s > 0 and refi_prorata else 0
+                refi_gp_s = refi_this * (gp_eq / total_eq_s) if total_eq_s > 0 and refi_prorata else 0
+                cf_list.append({'Year': year, 'NOI': noi_v, 'Cash Available': ca, 'Loan Balance': lb,
+                                'Refi': refi_this, 'Refi LP': refi_lp_s, 'Refi GP': refi_gp_s})
 
             cf_df_s = pd.DataFrame(cf_list)
 
             # Waterfall
-            wf_df = calculate_multi_year_waterfall(cf_df_s, lp_eq, gp_eq, pref_rate_val, gp_ps, incl_catchup)
+            wf_df = calculate_multi_year_waterfall(cf_df_s, lp_eq, gp_eq, pref_rate_val, gp_ps, incl_catchup, pref_on_unreturned)
 
-            # Exit
-            exit_noi_s = cf_df_s.iloc[-1]['NOI']
+            # Exit — use forward NOI if enabled
+            if use_fwd_noi:
+                fwd_s = calculate_multi_tenant_noi(tenants_list, hold_period + 1)
+                exit_noi_s = fwd_s.iloc[-1]['NOI']
+            else:
+                exit_noi_s = cf_df_s.iloc[-1]['NOI']
             exit_bal_s = cf_df_s.iloc[-1]['Loan Balance']
             sp = exit_noi_s / (exit_cap / 100)
             bc = sp * (broker_comm_pct / 100)
@@ -1821,23 +1737,6 @@ with tab4:
                 gce = min(rem, cu_need)
                 rem -= gce
 
-            # IRR helper (must be defined before promote/cap block uses it)
-            def _irr(cfs):
-                arr = np.array(cfs, dtype=float)
-                if np.sum(arr[1:]) <= 0:
-                    return None
-                low, high = -0.5, 5.0
-                for _ in range(200):
-                    mid = (low + high) / 2
-                    val = sum(c / (1 + mid)**t for t, c in enumerate(arr))
-                    if abs(val) < 0.01:
-                        return mid
-                    if val > 0:
-                        low = mid
-                    else:
-                        high = mid
-                return mid
-
             # Promote / LP cap logic
             if promote_mode == "IRR-Based Promote":
                 total_eq_chk = lp_eq + gp_eq
@@ -1847,7 +1746,7 @@ with tab4:
                     if i == len(wf_df) - 1:
                         annual_chk += gep
                     deal_cfs_chk.append(annual_chk)
-                d_irr_chk = _irr(deal_cfs_chk)
+                d_irr_chk = calculate_irr(deal_cfs_chk)
 
                 if d_irr_chk is not None and d_irr_chk * 100 > promote_hurdle_irr:
                     lp_es = rem * ((100 - gp_promote_share) / 100)
@@ -1868,7 +1767,7 @@ with tab4:
                         if i == len(wf_df) - 1:
                             cf += lp_fixed_exit + lp_res_share
                         cfs.append(cf)
-                    return _irr(cfs)
+                    return calculate_irr(cfs)
 
                 lp_irr_max = _lp_irr_at_share(rem)
                 target_cap_s = lp_irr_cap / 100.0
@@ -1913,12 +1812,17 @@ with tab4:
             for i in range(len(wf_df)):
                 la = wf_df.iloc[i]['LP Total'] + (lp_exit if i == len(wf_df)-1 else 0)
                 ga = wf_df.iloc[i]['GP Total'] + (gp_exit if i == len(wf_df)-1 else 0)
+                # Add pro-rata refi distributions
+                if refi_prorata and total_eq_inv > 0:
+                    refi_amt = cf_df_s.iloc[i].get('Refi', 0)
+                    la += refi_amt * (lp_eq / total_eq_inv)
+                    ga += refi_amt * (gp_eq / total_eq_inv)
                 lp_cfs.append(la)
                 gp_cfs.append(ga)
 
             deal_cfs = [-(lp_eq + gp_eq)] + [lp_cfs[i] + gp_cfs[i] for i in range(1, len(lp_cfs))]
 
-            return _irr(deal_cfs), _irr(lp_cfs)
+            return calculate_irr(deal_cfs), calculate_irr(lp_cfs)
         except Exception:
             return None, None
 
@@ -1929,50 +1833,45 @@ with tab4:
 
     def _run(pp_v, exit_cap_v, perm_rate_v, refi_cap_v):
         return quick_deal_irr(
-            pp_v, exit_cap_v, base_annual_rent, bump_frequency, bump_percentage, annual_escalator,
-            holding_period, runway['current_term_remaining'], runway['max_total_runway'], years_elapsed,
+            pp_v, exit_cap_v, st.session_state['tenants'], holding_period,
             deal_strategy, bridge_ltv, bridge_rate, bridge_term, bridge_io,
             perm_rate_v, perm_amort, perm_ltv, target_dscr,
             use_conservative, lp_equity_pct, gp_equity_pct, pref_rate, gp_profit_share,
             include_catchup, closing_costs_pct, _orig_pts, acquisition_fee_pct,
-            capex_reserve, prop_mgmt_pct, admin_costs,
+            capex_reserve, asset_mgmt_pct, admin_costs,
             refi_year, refi_valuation_method, refi_cap_v, fixed_refi_value, appreciation_rate,
             allow_cashout, max_cashout_pct, bridge_prepay_penalty, _perm_pts, _refi_leg,
-            broker_commission_pct, exit_legal_pct, disposition_fee_pct, rent_structure_type
+            broker_commission_pct, exit_legal_pct, disposition_fee_pct,
+            use_forward_noi
         )
 
     exit_cap_range = [5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0]
+    perm_rate_range = [round(perm_rate + d, 1) for d in [-1.0, -0.5, 0.0, 0.5, 1.0]]
 
-    # --- Sensitivity Table 1: Exit Cap Rate vs Refi Cap Rate (Deal IRR %) ---
-    st.markdown("### Exit Cap Rate vs Refi Cap Rate (Deal IRR %)")
-    refi_cap_range = [round(refi_cap_rate + d, 1) for d in [-1.0, -0.5, 0.0, 0.5, 1.0]]
+    # Single pass: compute both Deal IRR and LP IRR for each grid cell
+    sens_deal = {}
+    sens_lp   = {}
+    with st.spinner("Computing sensitivity grid..."):
+        for pr in perm_rate_range:
+            deal_row = []
+            lp_row   = []
+            for ec in exit_cap_range:
+                d_irr, lp_irr_v = _run(purchase_price, ec, pr, refi_cap_rate)
+                deal_row.append(f"{d_irr*100:.1f}%" if d_irr is not None else "N/A")
+                lp_row.append(f"{lp_irr_v*100:.1f}%" if lp_irr_v is not None else "N/A")
+            sens_deal[f"Perm Rate {pr}%"] = deal_row
+            sens_lp[f"Perm Rate {pr}%"]   = lp_row
 
-    sens1_data = {}
-    for rc in refi_cap_range:
-        row_vals = []
-        for ec in exit_cap_range:
-            d_irr, _ = _run(purchase_price, ec, perm_rate, rc)
-            row_vals.append(f"{d_irr*100:.1f}%" if d_irr is not None else "N/A")
-        sens1_data[f"Refi Cap {rc}%"] = row_vals
-
-    sens1_df = pd.DataFrame(sens1_data, index=[f"{ec}%" for ec in exit_cap_range])
+    # --- Table 1: Deal IRR ---
+    st.markdown("### Exit Cap Rate vs Perm Interest Rate (Deal IRR %)")
+    sens1_df = pd.DataFrame(sens_deal, index=[f"{ec}%" for ec in exit_cap_range])
     sens1_df.index.name = "Exit Cap Rate"
     st.dataframe(sens1_df, use_container_width=True)
 
-    # --- Sensitivity Table 2: Exit Cap Rate vs Perm Interest Rate (LP IRR %) ---
+    # --- Table 2: LP IRR ---
     st.markdown("---")
     st.markdown("### Exit Cap Rate vs Perm Interest Rate (LP IRR %)")
-    perm_rate_range = [round(perm_rate + d, 1) for d in [-1.0, -0.5, 0.0, 0.5, 1.0]]
-
-    sens2_data = {}
-    for pr in perm_rate_range:
-        row_vals = []
-        for ec in exit_cap_range:
-            _, lp_irr_v = _run(purchase_price, ec, pr, refi_cap_rate)
-            row_vals.append(f"{lp_irr_v*100:.1f}%" if lp_irr_v is not None else "N/A")
-        sens2_data[f"Perm Rate {pr}%"] = row_vals
-
-    sens2_df = pd.DataFrame(sens2_data, index=[f"{ec}%" for ec in exit_cap_range])
+    sens2_df = pd.DataFrame(sens_lp, index=[f"{ec}%" for ec in exit_cap_range])
     sens2_df.index.name = "Exit Cap Rate"
     st.dataframe(sens2_df, use_container_width=True)
 
@@ -1984,13 +1883,18 @@ with tab5:
 
     debt_data = []
     for _, row in cf_df.iterrows():
+        year_num = int(row['Year'])
         noi_val = row['NOI']
         ds_val = row['Debt Service']
         bal_val = row['Loan Balance']
 
         dscr_val = calculate_dscr(noi_val, ds_val)
         dy_val = calculate_debt_yield(noi_val, bal_val)
-        est_value = noi_val / (exit_cap_rate / 100) if exit_cap_rate > 0 else 0
+        # Property value estimate: purchase price in year 1, cap-rate-implied thereafter
+        if year_num == 1:
+            est_value = purchase_price
+        else:
+            est_value = noi_val / (exit_cap_rate / 100) if exit_cap_rate > 0 else purchase_price
         ltv_val = calculate_ltv(bal_val, est_value)
 
         debt_data.append({
@@ -2023,13 +1927,18 @@ with tab5:
         total_ds = debt_df['Debt Service'].sum()
         st.metric("Total Debt Service", f"${total_ds:,.0f}")
 
-    # Lender comfort check
-    st.markdown("### Lender Comfort Check")
+    # Lender comfort check — flag covenant breaches per year
+    st.markdown("### Covenant Monitoring")
     issues = []
+    breach_years = []
+    for _, drow in debt_df.iterrows():
+        yr = int(drow['Year'])
+        if drow['DSCR'] < target_dscr and drow['DSCR'] != float('inf'):
+            breach_years.append(yr)
     if min_dscr < 1.0:
-        issues.append(f"DSCR below 1.0x in Year {min_dscr_year} ({min_dscr:.2f}x) -- negative cash flow")
-    elif min_dscr < 1.25:
-        issues.append(f"DSCR below 1.25x in Year {min_dscr_year} ({min_dscr:.2f}x) -- tight coverage")
+        issues.append(f"DSCR below 1.0x in Year {min_dscr_year} ({min_dscr:.2f}x) — negative cash flow")
+    elif breach_years:
+        issues.append(f"DSCR below covenant minimum ({target_dscr:.2f}x) in Year(s): {', '.join(str(y) for y in breach_years)}")
     if max_ltv > 80:
         issues.append(f"LTV exceeds 80% in Year {max_ltv_year} ({max_ltv:.1f}%)")
 
@@ -2037,7 +1946,7 @@ with tab5:
         for issue in issues:
             st.warning(f"Warning: {issue}")
     else:
-        st.success("All debt metrics within typical lender thresholds")
+        st.success(f"All debt metrics within covenant thresholds (DSCR >= {target_dscr:.2f}x, LTV <= 80%)")
 
     # Full table
     st.markdown("---")
@@ -2055,12 +1964,37 @@ with tab5:
         hide_index=True
     )
 
+    # DSCR & LTV trend chart (dual axis)
+    fig_debt = make_subplots(specs=[[{"secondary_y": True}]])
+    # Filter out inf DSCR for display
+    dscr_display = debt_df['DSCR'].replace([float('inf')], None)
+    fig_debt.add_trace(go.Scatter(x=debt_df['Year'], y=dscr_display, name='DSCR',
+                                   mode='lines+markers', line=dict(color='#4CAF50', width=3)), secondary_y=False)
+    fig_debt.add_trace(go.Scatter(x=debt_df['Year'], y=debt_df['LTV (%)'], name='LTV %',
+                                   mode='lines+markers', line=dict(color='#F44336', width=3)), secondary_y=True)
+    # Covenant line
+    fig_debt.add_hline(y=target_dscr, line_dash="dash", line_color="gray", annotation_text=f"DSCR Covenant ({target_dscr:.2f}x)")
+    fig_debt.update_layout(title='DSCR & LTV Over Hold Period', height=350, margin=dict(t=40, b=30))
+    fig_debt.update_yaxes(title_text="DSCR (x)", secondary_y=False)
+    fig_debt.update_yaxes(title_text="LTV (%)", secondary_y=True)
+    st.plotly_chart(fig_debt, use_container_width=True)
+
+    # Loan balance paydown chart
+    fig_bal = go.Figure()
+    fig_bal.add_trace(go.Bar(x=debt_df['Year'], y=debt_df['Loan Balance'], name='Loan Balance', marker_color='#9C27B0'))
+    fig_bal.update_layout(title='Loan Balance Over Time', xaxis_title='Year', yaxis_title='$',
+                          yaxis_tickformat='$,.0f', height=300, margin=dict(t=40, b=30))
+    st.plotly_chart(fig_bal, use_container_width=True)
+
     # Principal paydown table (for amortizing loans)
     st.markdown("---")
     st.markdown("### Principal Paydown Schedule")
     paydown_data = []
     for i in range(len(debt_df)):
         row = debt_df.iloc[i]
+        year_num = int(row['Year'])
+
+        # Determine starting balance
         if i == 0:
             if deal_strategy == "Bridge-to-Permanent (Value-Add)":
                 starting_balance = bridge_loan_amount
@@ -2070,11 +2004,31 @@ with tab5:
             starting_balance = debt_df.iloc[i-1]['Loan Balance']
 
         ending_balance = row['Loan Balance']
-        principal_paid = starting_balance - ending_balance
-        interest_paid = row['Debt Service'] - principal_paid if principal_paid >= 0 else row['Debt Service']
+
+        # Check if this is a refi year (loan balance increases)
+        is_refi_year = (ending_balance > starting_balance) if i > 0 else False
+
+        if is_refi_year:
+            # In refi year: calculate based on old loan, then reset for new loan
+            # The debt service shown is for the NEW loan (which started this year)
+            # Interest = new loan rate × new loan balance (for 1 year)
+            if deal_strategy == "Bridge-to-Permanent (Value-Add)" and year_num == refi_year:
+                # Bridge to perm: new perm loan started this year
+                interest_paid = ending_balance * (perm_rate / 100)
+            else:
+                # Buy-and-hold refi
+                interest_paid = ending_balance * (perm_rate / 100)
+
+            principal_paid = row['Debt Service'] - interest_paid
+            # Reset starting balance to new loan amount for display
+            starting_balance = ending_balance
+        else:
+            # Normal year: principal = starting - ending
+            principal_paid = starting_balance - ending_balance
+            interest_paid = row['Debt Service'] - principal_paid
 
         paydown_data.append({
-            'Year': int(row['Year']),
+            'Year': year_num,
             'Starting Balance': starting_balance,
             'Principal Paid': max(0, principal_paid),
             'Interest Paid': interest_paid,
@@ -2092,6 +2046,198 @@ with tab5:
         use_container_width=True,
         hide_index=True
     )
+
+# =========================================================================
+# TAB 6 — TAX & DEPRECIATION
+# =========================================================================
+with tab6:
+    st.subheader("🏛️ Tax & Depreciation Analysis")
+    st.caption("After-tax overlay on pre-tax cash flows. Does not affect other tabs.")
+
+    tcol1, tcol2 = st.columns(2)
+    with tcol1:
+        marginal_tax_rate = st.number_input("Marginal Tax Rate (%)", value=37.0, min_value=0.0, max_value=60.0, step=0.5, key="marginal_tax_rate")
+        cap_gains_rate = st.number_input("Capital Gains Rate (%)", value=20.0, min_value=0.0, max_value=40.0, step=0.5, key="cap_gains_rate")
+        depreciation_recapture_rate = st.number_input("Depreciation Recapture Rate (%)", value=25.0, min_value=0.0, max_value=40.0, step=0.5, key="depreciation_recapture_rate")
+    with tcol2:
+        land_allocation_pct = st.number_input("Land Allocation (%)", value=20.0, min_value=0.0, max_value=50.0, step=1.0, key="land_allocation_pct",
+                                               help="Land is not depreciable. Typical 15-20% for commercial.")
+        depreciation_method = st.selectbox("Depreciation Method", options=[
+            "39-Year Straight Line (Commercial)",
+            "27.5-Year Straight Line (Residential)",
+            "Cost Segregation"
+        ], key="depreciation_method")
+        if depreciation_method == "Cost Segregation":
+            cost_seg_5yr_pct = st.number_input("5-Year Property (%)", value=15.0, step=1.0, key="cost_seg_5yr")
+            cost_seg_15yr_pct = st.number_input("15-Year Property (%)", value=15.0, step=1.0, key="cost_seg_15yr")
+            cost_seg_remaining_pct = 100.0 - land_allocation_pct - cost_seg_5yr_pct - cost_seg_15yr_pct
+            st.caption(f"Remaining {cost_seg_remaining_pct:.0f}% on 39-year schedule")
+        else:
+            cost_seg_5yr_pct = 0
+            cost_seg_15yr_pct = 0
+
+    st.markdown("---")
+
+    # --- Depreciation Schedule ---
+    depreciable_basis = purchase_price * (1 - land_allocation_pct / 100)
+
+    # Build annual depreciation
+    tax_data = []
+    cumulative_depreciation = 0
+
+    for _, row in cf_df.iterrows():
+        yr = int(row['Year'])
+        noi_yr = row['NOI']
+        ds_yr = row['Debt Service']
+        lb_yr = row['Loan Balance']
+
+        # Interest component of debt service (approximate: loan balance * rate)
+        # For more accuracy, we'd track interest vs principal separately
+        # Approximation: interest = beginning balance * rate
+        if yr == 1:
+            if deal_strategy == "Bridge-to-Permanent (Value-Add)":
+                interest_expense = bridge_loan_amount * (bridge_rate / 100)
+            else:
+                interest_expense = initial_loan_amount * (perm_rate / 100)
+        elif yr <= refi_year or refi_year == 999:
+            if deal_strategy == "Bridge-to-Permanent (Value-Add)":
+                prev_bal = calculate_bridge_loan_balance(bridge_loan_amount, bridge_rate, bridge_term, yr - 1, bridge_io)
+                interest_expense = prev_bal * (bridge_rate / 100)
+            else:
+                prev_bal = calculate_perm_loan_balance(initial_loan_amount, perm_rate, perm_amort, yr - 1)
+                interest_expense = prev_bal * (perm_rate / 100)
+        else:
+            # Post-refi: perm loan interest
+            if refi_results:
+                yrs_since = yr - refi_year
+                prev_bal = calculate_perm_loan_balance(refi_results['new_loan_amount'], perm_rate, perm_amort, yrs_since)
+                interest_expense = prev_bal * (perm_rate / 100)
+            else:
+                interest_expense = 0
+
+        # Annual depreciation by method
+        if depreciation_method == "Cost Segregation":
+            depr_5yr = depreciable_basis * (cost_seg_5yr_pct / 100) / 5 if yr <= 5 else 0
+            depr_15yr = depreciable_basis * (cost_seg_15yr_pct / 100) / 15 if yr <= 15 else 0
+            depr_39yr = depreciable_basis * (cost_seg_remaining_pct / 100) / 39 if yr <= 39 else 0
+            annual_depreciation = depr_5yr + depr_15yr + depr_39yr
+        elif "27.5" in depreciation_method:
+            annual_depreciation = depreciable_basis / 27.5 if yr <= 27 else 0
+        else:
+            annual_depreciation = depreciable_basis / 39 if yr <= 39 else 0
+
+        cumulative_depreciation += annual_depreciation
+
+        # Taxable income
+        taxable_income = noi_yr - interest_expense - annual_depreciation
+        tax_liability = max(0, taxable_income * (marginal_tax_rate / 100))
+
+        # After-tax cash flow (pre-tax cash available minus taxes)
+        pretax_cf = row['Cash Available']
+        after_tax_cf = pretax_cf - tax_liability
+
+        tax_data.append({
+            'Year': yr,
+            'NOI': noi_yr,
+            'Interest': interest_expense,
+            'Depreciation': annual_depreciation,
+            'Cumulative Depr.': cumulative_depreciation,
+            'Taxable Income': taxable_income,
+            'Tax Liability': tax_liability,
+            'Pre-Tax CF': pretax_cf,
+            'After-Tax CF': after_tax_cf
+        })
+
+    tax_df = pd.DataFrame(tax_data)
+
+    # --- Disposition Tax ---
+    adjusted_basis = purchase_price - cumulative_depreciation
+    gain_on_sale = sale_price - adjusted_basis - total_sale_costs
+    depreciation_recapture_amount = min(cumulative_depreciation, max(0, gain_on_sale))
+    capital_gain_amount = max(0, gain_on_sale - depreciation_recapture_amount)
+
+    recapture_tax = depreciation_recapture_amount * (depreciation_recapture_rate / 100)
+    cap_gains_tax = capital_gain_amount * (cap_gains_rate / 100)
+    total_tax_on_sale = recapture_tax + cap_gains_tax
+
+    after_tax_exit_proceeds = gross_equity_proceeds - total_tax_on_sale
+
+    # --- Display ---
+    st.markdown("### Annual Tax Analysis")
+    st.dataframe(
+        tax_df.style.format({
+            'NOI': '${:,.0f}',
+            'Interest': '${:,.0f}',
+            'Depreciation': '${:,.0f}',
+            'Cumulative Depr.': '${:,.0f}',
+            'Taxable Income': '${:,.0f}',
+            'Tax Liability': '${:,.0f}',
+            'Pre-Tax CF': '${:,.0f}',
+            'After-Tax CF': '${:,.0f}'
+        }),
+        use_container_width=True,
+        hide_index=True
+    )
+
+    # After-tax vs pre-tax chart
+    fig_tax = go.Figure()
+    fig_tax.add_trace(go.Bar(x=tax_df['Year'], y=tax_df['Pre-Tax CF'], name='Pre-Tax CF', marker_color='#2196F3'))
+    fig_tax.add_trace(go.Bar(x=tax_df['Year'], y=tax_df['After-Tax CF'], name='After-Tax CF', marker_color='#4CAF50'))
+    fig_tax.add_trace(go.Bar(x=tax_df['Year'], y=tax_df['Tax Liability'], name='Tax Liability', marker_color='#F44336'))
+    fig_tax.update_layout(title='Pre-Tax vs After-Tax Cash Flow', barmode='group',
+                          xaxis_title='Year', yaxis_title='$', yaxis_tickformat='$,.0f',
+                          height=350, margin=dict(t=40, b=30))
+    st.plotly_chart(fig_tax, use_container_width=True)
+
+    # Disposition tax summary
+    st.markdown("---")
+    st.markdown("### Disposition Tax Summary")
+    dcol1, dcol2, dcol3 = st.columns(3)
+    with dcol1:
+        st.metric("Adjusted Basis", f"${adjusted_basis:,.0f}")
+        st.metric("Gain on Sale", f"${gain_on_sale:,.0f}")
+    with dcol2:
+        st.metric("Depreciation Recapture Tax", f"${recapture_tax:,.0f}")
+        st.metric("Capital Gains Tax", f"${cap_gains_tax:,.0f}")
+    with dcol3:
+        st.metric("Total Tax on Sale", f"${total_tax_on_sale:,.0f}")
+        st.metric("After-Tax Exit Proceeds", f"${after_tax_exit_proceeds:,.0f}")
+
+    # After-tax IRR
+    st.markdown("---")
+    st.markdown("### After-Tax Return Comparison")
+    # Build after-tax LP cash flows (simplified: assume LP bears tax proportionally)
+    total_equity_for_tax = lp_equity + gp_equity
+    lp_share_of_equity = lp_equity / total_equity_for_tax if total_equity_for_tax > 0 else 0
+
+    at_lp_cfs = [-lp_equity]
+    for i in range(len(tax_df)):
+        # LP's share of after-tax operating CF
+        lp_wf = waterfall_df.iloc[i]['LP Total']
+        tax_hit = tax_df.iloc[i]['Tax Liability'] * lp_share_of_equity
+        lp_at = lp_wf - tax_hit
+        # Add refi distributions
+        lp_at += cf_df.iloc[i]['Refi LP']
+        # Add after-tax exit in final year
+        if i == len(tax_df) - 1:
+            lp_at += lp_exit_total - (total_tax_on_sale * lp_share_of_equity)
+        at_lp_cfs.append(lp_at)
+
+    at_lp_irr = calculate_irr(at_lp_cfs)
+
+    rcol1, rcol2, rcol3 = st.columns(3)
+    with rcol1:
+        st.metric("Pre-Tax LP IRR", f"{lp_irr*100:.2f}%" if lp_irr is not None else "N/A")
+    with rcol2:
+        st.metric("After-Tax LP IRR", f"{at_lp_irr*100:.2f}%" if at_lp_irr is not None else "N/A")
+    with rcol3:
+        if lp_irr and at_lp_irr:
+            drag = (lp_irr - at_lp_irr) * 100
+            st.metric("Tax Drag", f"{drag:.2f}%", delta=f"-{drag:.1f}%", delta_color="inverse")
+        else:
+            st.metric("Tax Drag", "N/A")
+
+    st.info("Note: Tax analysis is an estimate. Consult a CPA for actual tax implications. 1031 exchange can defer all taxes at disposition.")
 
 # =========================================================================
 # PDF EXPORT  –  runs after all tabs so every variable is populated
