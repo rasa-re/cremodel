@@ -1,4 +1,16 @@
 import numpy as np
+import numpy_financial as npf
+
+
+def calculate_irr(cash_flows: list) -> float | None:
+    """Return IRR for a cash flow series, or None if it cannot be computed."""
+    try:
+        result = npf.irr(cash_flows)
+        if result is None or np.isnan(result):
+            return None
+        return float(result)
+    except Exception:
+        return None
 
 def calculate_bridge_loan_payment(loan_amount, annual_rate, term_years, is_io):
     """Calculate annual debt service for bridge loan"""
